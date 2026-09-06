@@ -1,0 +1,6 @@
+{
+  "name": "Market-Only Trading Bot",
+  "description": "Algorithmic cryptocurrency market-only trading bot operations center with live paper trading simulator, multi-timeframe 5-factor confluence indicators, ATR risk control, and full Python project codebase manager.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
