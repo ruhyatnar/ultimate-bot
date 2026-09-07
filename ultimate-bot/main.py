@@ -70,7 +70,9 @@ async def main():
     )
 
     def get_current_symbols():
-        return trade_logic.current_symbols if trade_logic.current_symbols else config["STATIC_SYMBOLS"]
+        base = trade_logic.current_symbols if trade_logic.current_symbols else config["STATIC_SYMBOLS"]
+        active = list(trade_logic.active_trades.keys())
+        return list(dict.fromkeys(base + active))
 
     health = HealthCheck(
         config, rest, ws_api, ws_stream, db, webhook,
@@ -95,12 +97,12 @@ async def main():
                 except Exception:
                     pass
 
-        await trade_logic.update_symbols()
         await trade_logic.reconcile_positions()
+        await trade_logic.update_symbols()
 
         # Connect public WebSocket market stream for real-time tick prices
         try:
-            await ws_stream.connect(trade_logic.current_symbols)
+            await ws_stream.connect(get_current_symbols())
         except Exception as e:
             logger.warning(f"WebSocket stream initial connect issue (falling back to REST): {e}")
 

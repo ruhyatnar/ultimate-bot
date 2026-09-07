@@ -135,8 +135,9 @@ class DatabaseManager:
              trade.get("order_id")))
 
     async def get_active_trades(self):
-        rows = await self.fetch_all("SELECT * FROM active_trades")
         keys = ["symbol","entry_price","side","quantity","entry_time","stop_price","take_profit","atr","trailing_active","trailing_stop","breakeven_activated","order_id"]
+        query = f"SELECT {', '.join(keys)} FROM active_trades"
+        rows = await self.fetch_all(query)
         result = []
         for row in rows:
             d = dict(zip(keys, row))

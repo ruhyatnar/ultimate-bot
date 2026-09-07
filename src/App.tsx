@@ -699,6 +699,15 @@ export default function App() {
   // Close an active trade safely with unique closed ID.
   // PnL is NET of round-trip taker fees (0.2%) so paper results match live expectations.
   const handleCloseTrade = useCallback((symbol: string, reason: string, customExitPrice?: number) => {
+    if (dataSourceRef.current === 'vps' && vpsStatusRef.current.connected) {
+      sendVpsControl('close_symbol', symbol).then(ok => {
+        if (ok) {
+          addLog('WARN', 'ORDER', `Manual market close requested for ${symbol} on live VPS engine.`, symbol);
+        }
+      });
+      return;
+    }
+
     const trade = activeTradesRef.current.find(t => t.symbol === symbol);
     if (!trade) return;
 

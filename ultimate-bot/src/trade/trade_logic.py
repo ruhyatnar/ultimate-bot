@@ -134,7 +134,9 @@ class TradeLogic:
             allowed_new = max(0, self.config["MAX_SYMBOLS"] - len(active_symbols))
             new_symbols = list(active_symbols) + new_symbols[:allowed_new]
         else:
-            new_symbols = self.config["STATIC_SYMBOLS"]
+            # In static mode, always retain any currently active trades so they stay monitored
+            active_symbols = list(self.active_trades.keys())
+            new_symbols = list(dict.fromkeys(active_symbols + self.config["STATIC_SYMBOLS"]))
 
         valid_symbols = []
         for s in new_symbols:
@@ -144,6 +146,9 @@ class TradeLogic:
             info = await self.rest.get_symbol_info(s)
             if info and info.get("status") == "TRADING":
                 valid_symbols.append(s)
+            elif s in self.active_trades:
+                # If an active trade is open, keep it in valid_symbols even if info lookup had a glitch
+                valid_symbols.append(s)
             else:
                 self.logger.warning(f"Symbol {s} not tradable; skipping.")
         if set(valid_symbols) != set(self.current_symbols):
@@ -152,7 +157,7 @@ class TradeLogic:
             self.current_symbols = valid_symbols
             if not self.config["PAPER_TRADE"] and self.ws_stream.is_connected():
                 add_syms = [s for s in valid_symbols if s not in old_symbols]
-                remove_syms = [s for s in old_symbols if s not in valid_symbols]
+                remove_syms = [s for s in old_symbols if s not in valid_symbols and s not in self.active_trades]
                 if add_syms: await self.ws_stream.subscribe(add_syms)
                 if remove_syms: await self.ws_stream.unsubscribe(remove_syms)
 
@@ -192,7 +197,19 @@ class TradeLogic:
                     self.last_exchange_sync_time = now
             if not self.current_symbols:
                 await self.update_symbols()
+
+            # 1. ALWAYS manage all open active trades first to guarantee stops, TPs, trailing stops
+            # and time stops are evaluated every single cycle regardless of whether the symbol is in current_symbols.
+            for symbol in list(self.active_trades.keys()):
+                try:
+                    await self.manage_trade(symbol)
+                except Exception as e:
+                    self.logger.error(f"Error managing active trade {symbol}: {e}")
+
+            # 2. Evaluate un-entered symbols for potential entry
             for symbol in self.current_symbols:
+                if symbol in self.active_trades:
+                    continue
                 try:
                     await self.process_symbol(symbol)
                 except Exception as e:
@@ -280,6 +297,18 @@ class TradeLogic:
                             take_profit = entry_price + min_tp_dist
                 except Exception as e:
                     self.logger.warning(f"Could not fetch avg fill price: {e}")
+
+                # Verify actual net base asset credited (accounts for base-asset taker fee deduction)
+                try:
+                    account = await self.rest.get_account()
+                    quote_asset = self.config.get("QUOTE_ASSET", "USDT")
+                    base_asset = symbol[:-len(quote_asset)] if symbol.endswith(quote_asset) else symbol
+                    free_base = next((float(b["free"]) for b in account.get("balances", []) if b["asset"] == base_asset), None)
+                    if free_base is not None and 0 < free_base < qty:
+                        self.logger.info(f"{symbol}: Net available {base_asset} is {free_base} (taker fee deducted from base asset). Updating tracked position size from {qty} to {free_base}.")
+                        qty = free_base
+                except Exception as e:
+                    self.logger.warning(f"Could not verify net base asset balance: {e}")
 
         trade = {
             "symbol": symbol, "entry_price": entry_price, "side": side, "quantity": qty,
@@ -437,7 +466,39 @@ class TradeLogic:
                 self.logger.error(f"Could not resolve exit fill price for {symbol}: {e}")
                 fill_price = trade["entry_price"]
 
-        remaining_qty = original_qty - executed_qty
+        remaining_qty = max(0.0, original_qty - executed_qty)
+        is_partial = False
+
+        if remaining_qty > 0:
+            if self.config["PAPER_TRADE"]:
+                # In paper trading, only treat as partial if remaining notional is significant
+                is_partial = (remaining_qty * fill_price >= 5.0)
+            else:
+                # In live trading, check if actual remaining base balance on Binance is tradable
+                try:
+                    filters = await self.rest.get_filters(symbol)
+                    min_notional = float(filters.get("NOTIONAL", filters.get("MIN_NOTIONAL", {})).get("minNotional", 5.0))
+                    lot_size = filters.get("LOT_SIZE", {})
+                    min_qty = float(lot_size.get("minQty", "0.00001"))
+
+                    account = await self.rest.get_account()
+                    quote_asset = self.config.get("QUOTE_ASSET", "USDT")
+                    base_asset = symbol[:-len(quote_asset)] if symbol.endswith(quote_asset) else symbol
+                    free_base = next((float(b["free"]) for b in account.get("balances", []) if b["asset"] == base_asset), 0.0)
+
+                    # If remaining free base is marketable on Binance, treat as partial.
+                    # Otherwise, it's non-tradable dust/fee remainder: position is closed!
+                    if free_base * fill_price >= min_notional and free_base >= min_qty:
+                        is_partial = True
+                        remaining_qty = free_base
+                    else:
+                        self.logger.info(f"{symbol}: Remaining base {free_base} ({free_base * fill_price:.2f} USDT) is non-tradable dust (< minNotional {min_notional}). Marking trade as FULL EXIT.")
+                        is_partial = False
+                        remaining_qty = 0.0
+                except Exception as e:
+                    self.logger.warning(f"Could not verify remaining balance for {symbol}: {e}")
+                    is_partial = False
+                    remaining_qty = 0.0
 
         # Professional net PnL calculation deducting Binance spot exchange taker commissions (0.1% each leg)
         fee_rate = 0.001
@@ -455,9 +516,9 @@ class TradeLogic:
                 pass
 
         # Partial exit = the order was canceled after a partial fill; full exit = FILLED.
-        exit_status = "CANCELED" if remaining_qty > 0 else "FILLED"
+        exit_status = "CANCELED" if (is_partial and remaining_qty > 0) else "FILLED"
         await self.db.update_order_status(exit_order_id, exit_status, executed_qty, fill_price, profit_loss=pnl)
-        if remaining_qty > 0:
+        if is_partial and remaining_qty > 0:
             trade["quantity"] = remaining_qty
             self.active_trades[symbol] = trade
             await self.db.save_active_trade(trade)
@@ -476,7 +537,7 @@ class TradeLogic:
         active = await self.db.get_active_trades()
         for trade in active:
             self.active_trades[trade["symbol"]] = trade
-            self.logger.info(f"Restored active trade for {trade['symbol']}")
+            self.logger.info(f"Restored active trade for {trade['symbol']} (entry={trade['entry_price']}, qty={trade['quantity']}, stop={trade['stop_price']}, tp={trade['take_profit']})")
         await self.sync_positions_from_exchange()
 
     async def sync_positions_from_exchange(self):
@@ -485,27 +546,83 @@ class TradeLogic:
             account = await self.rest.get_account()
             quote_asset = self.config["QUOTE_ASSET"]
             asset_balances = {}
-            for b in account["balances"]:
-                asset = b["asset"]
-                free = float(b["free"])
-                if asset != quote_asset and free > 0:
-                    asset_balances[asset + quote_asset] = free
+            for b in account.get("balances", []):
+                asset = b.get("asset", "")
+                free = float(b.get("free", 0.0))
+                locked = float(b.get("locked", 0.0))
+                total = free + locked
+                if asset != quote_asset and total > 0:
+                    asset_balances[asset + quote_asset] = {
+                        "total": total,
+                        "free": free,
+                        "locked": locked,
+                        "asset": asset
+                    }
+
             managed_symbols = set(self.current_symbols) | set(self.active_trades.keys())
             auto_liquidate = self.config.get("AUTO_LIQUIDATE_ORPHANS", False)
-            for symbol, free_balance in asset_balances.items():
+
+            # 1. Check all currently tracked active trades against Binance balances
+            for symbol, trade in list(self.active_trades.items()):
+                bal_info = asset_balances.get(symbol)
+                total_bal = bal_info["total"] if bal_info else 0.0
+
+                price = await self.ws_stream.get_current_price(symbol)
+                if not price:
+                    try:
+                        ticker = await self.rest.get_ticker(symbol)
+                        price = float(ticker["price"])
+                    except Exception:
+                        price = trade.get("entry_price", 0.0)
+
+                filters = await self.rest.get_filters(symbol)
+                min_notional = float(filters.get("NOTIONAL", filters.get("MIN_NOTIONAL", {})).get("minNotional", 5.0))
+                lot_size = filters.get("LOT_SIZE", {})
+                min_qty = float(lot_size.get("minQty", "0.00001"))
+                notional_val = total_bal * price
+
+                # If the balance is zero or non-marketable dust, it was closed or liquidated externally
+                if total_bal < min_qty or notional_val < min_notional:
+                    self.active_trades.pop(symbol, None)
+                    await self.db.delete_active_trade(symbol)
+                    self.logger.warning(f"Active trade for {symbol} has no marketable Binance balance (balance={total_bal}, value=${notional_val:.2f} < ${min_notional:.2f}); removed from tracking.")
+                    await self.webhook.send(f"ℹ️ Active trade for {symbol} removed from tracking (balance below minNotional / closed externally).")
+                    continue
+
+                # If balance is valid but differs from tracked quantity (e.g. fees or partial manual trade), reconcile
+                if bal_info and abs(trade["quantity"] - bal_info["free"]) > min_qty and bal_info["free"] >= min_qty:
+                    old_qty = trade["quantity"]
+                    trade["quantity"] = bal_info["free"]
+                    self.active_trades[symbol] = trade
+                    await self.db.save_active_trade(trade)
+                    self.logger.info(f"{symbol}: Reconciled tracked position quantity from {old_qty} to {bal_info['free']} to match Binance free balance.")
+
+            # 2. Check for unmanaged/orphan balances on the exchange
+            for symbol, bal_info in asset_balances.items():
                 if symbol in managed_symbols and symbol not in self.active_trades:
+                    free_balance = bal_info["free"]
+                    price = await self.ws_stream.get_current_price(symbol)
+                    if not price:
+                        try:
+                            ticker = await self.rest.get_ticker(symbol)
+                            price = float(ticker["price"])
+                        except Exception:
+                            continue
+                    filters = await self.rest.get_filters(symbol)
+                    min_notional = float(filters.get("NOTIONAL", filters.get("MIN_NOTIONAL", {})).get("minNotional", 5.0))
+                    lot_size = filters.get("LOT_SIZE", {})
+                    min_qty = float(lot_size.get("minQty", "0.00001"))
+
+                    # Ignore dust orphan balances that cannot be traded on Binance
+                    if free_balance < min_qty or free_balance * price < min_notional:
+                        continue
+
                     if auto_liquidate:
-                        self.logger.warning(f"AUTO_LIQUIDATE_ORPHANS=True: closing {symbol} balance={free_balance}")
+                        self.logger.warning(f"AUTO_LIQUIDATE_ORPHANS=True: closing orphan position {symbol} balance={free_balance} (${free_balance * price:.2f})")
                         await self.order_mgr.place_market_order(symbol, "SELL", free_balance)
                         await self.webhook.send(f"⚠️ Orphan position closed for {symbol}: {free_balance} units")
                     else:
-                        self.logger.info(f"Unmanaged balance detected for {symbol}: {free_balance}. Leaving untouched (AUTO_LIQUIDATE_ORPHANS=False).")
-            for symbol in list(self.active_trades.keys()):
-                if symbol in managed_symbols and symbol not in asset_balances:
-                    self.active_trades.pop(symbol, None)
-                    await self.db.delete_active_trade(symbol)
-                    self.logger.warning(f"Active trade for {symbol} has no balance; removing.")
-                    await self.webhook.send(f"ℹ️ Active trade for {symbol} removed (balance zero).")
+                        self.logger.info(f"Unmanaged balance detected for {symbol}: {free_balance} (${free_balance * price:.2f}). Leaving untouched (AUTO_LIQUIDATE_ORPHANS=False).")
         except Exception as e:
             self.logger.error(f"Error during exchange sync: {e}")
             await self.webhook.send(f"❌ Exchange sync error: {e}")
