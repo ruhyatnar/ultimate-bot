@@ -18,7 +18,6 @@ ultimate-bot/data/engine_control.json
 ultimate-bot/logs/*
 !ultimate-bot/logs/.gitkeep
 ultimate-bot/keys/*.pem
-ultimate-bot/.env
 
 # Env files (template allowed)
 .env*
