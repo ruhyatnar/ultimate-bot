@@ -25,6 +25,7 @@ class RestClient:
         self.limiter = AsyncLimiter(config.get("REST_WEIGHT_LIMIT", 1200), 60)
         self.exchange_info_cache = {}
         self.symbol_info_cache = {}
+        self._exchange_info_ts = 0.0
         self.timeout = aiohttp.ClientTimeout(total=15)
         self.time_offset = 0
         self.last_time_sync = 0
@@ -43,12 +44,15 @@ class RestClient:
             self.session = aiohttp.ClientSession(timeout=self.timeout)
 
     async def _load_exchange_info(self):
-        if self.exchange_info_cache:
+        # Refresh exchangeInfo every 24h: Binance occasionally delists symbols or
+        # changes LOT_SIZE/minNotional filters — a stale cache causes -1013 rejections.
+        now = time.time()
+        if self.exchange_info_cache and now - self._exchange_info_ts < 86400:
             return
         data = await self._request_internal("GET", "/api/v3/exchangeInfo")
         self.exchange_info_cache = data
-        for s in data.get("symbols", []):
-            self.symbol_info_cache[s["symbol"]] = s
+        self.symbol_info_cache = {s["symbol"]: s for s in data.get("symbols", [])}
+        self._exchange_info_ts = now
         self.logger.info(f"Exchange Info cached for {len(self.symbol_info_cache)} symbols.")
 
     async def init(self):

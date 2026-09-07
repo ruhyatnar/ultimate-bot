@@ -7,9 +7,12 @@ import {
   MarketSymbolData, 
   LogMessage,
   CandidateSymbol,
-  VpsBotStatus
+  VpsBotStatus,
+  VpsControlState,
+  PushResult
 } from './types';
 import { analyzeCandles } from './utils/technicalAnalysis';
+import { TAKER_FEE_RATE, MIN_NOTIONAL_USDT, BREAKEVEN_FEE_MULTIPLIER, effectiveAllocation, generateEnvString } from './utils/envGenerator';
 import { Header } from './components/Header';
 import { VpsConnectionBar } from './components/VpsConnectionBar';
 import { LiveDashboard } from './components/LiveDashboard';
@@ -126,7 +129,7 @@ export default function App() {
         return { ...DEFAULT_CONFIG, ...JSON.parse(saved) };
       }
     } catch (e) {
-      // fallback
+      // fallback to defaults
     }
     return DEFAULT_CONFIG;
   });
@@ -134,10 +137,16 @@ export default function App() {
   const [isRunning, setIsRunning] = useState<boolean>(true);
   const [activeTab, setActiveTab] = useState<'dashboard' | 'signals' | 'debug' | 'code' | 'config' | 'deploy'>('dashboard');
 
+  // `equity`/`dailyRealizedPnl` are simulator-owned state. In VPS mode they are
+  // populated from the server's SQLite risk_state — never locally, so the UI never
+  // presents a fake $1000 balance as real live-server equity.
   const [equity, setEquity] = useState<number>(1000.0);
   const [dailyRealizedPnl, setDailyRealizedPnl] = useState<number>(0.0);
+  const [vpsRiskAvailable, setVpsRiskAvailable] = useState<boolean>(false);
   const [winStreak, setWinStreak] = useState<number>(0);
   const [lossStreak, setLossStreak] = useState<number>(0);
+  const [isLossCooldown, setIsLossCooldown] = useState<boolean>(false);
+  const [cooldownEndsAt, setCooldownEndsAt] = useState<number>(0);
 
   const [dataSource, setDataSource] = useState<'vps' | 'simulator'>(() => {
     try {
@@ -160,6 +169,14 @@ export default function App() {
     engineStatus: 'CHECKING...',
     engineRunning: false
   });
+  const [vpsControl, setVpsControl] = useState<VpsControlState>({ paused: false });
+  const vpsControlRef = useRef<VpsControlState>({ paused: false });
+  vpsControlRef.current = vpsControl;
+
+  const vpsStatusRef = useRef<VpsBotStatus>(vpsStatus);
+  vpsStatusRef.current = vpsStatus;
+
+  const [vpsPushResult, setVpsPushResult] = useState<PushResult | null>(null);
 
   const [activeTrades, setActiveTrades] = useState<ActiveTrade[]>([]);
   const [closedTrades, setClosedTrades] = useState<ClosedTrade[]>([]);
@@ -168,12 +185,15 @@ export default function App() {
   const [useLiveBinanceFeed, setUseLiveBinanceFeed] = useState<boolean>(false);
   const [selectedPinnedSymbols, setSelectedPinnedSymbols] = useState<string[]>(['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT']);
 
-  // Candle history ref for each symbol
+  // Candle history per symbol (shared ref, mutated in place for performance)
   const candlesRef = useRef<Record<string, { open: number; high: number; low: number; close: number; volume: number }[]>>({});
   const [symbolsData, setSymbolsData] = useState<MarketSymbolData[]>([]);
   const [candidates, setCandidates] = useState<CandidateSymbol[]>([]);
 
-  // Ref mirrors to avoid timer resets during rapid VPS polling
+  // Per-symbol cooldowns after closes (mirrors symbol_cooldowns in the Python engine)
+  const cooldownsRef = useRef<Record<string, number>>({});
+
+  // Ref mirrors so timers and callbacks always read fresh state without resetting intervals
   const activeTradesRef = useRef<ActiveTrade[]>(activeTrades);
   activeTradesRef.current = activeTrades;
 
@@ -189,14 +209,18 @@ export default function App() {
   const dataSourceRef = useRef<'vps' | 'simulator'>(dataSource);
   dataSourceRef.current = dataSource;
 
+  const lossStreakRef = useRef<number>(lossStreak);
+  lossStreakRef.current = lossStreak;
+
+  const cooldownUntilRef = useRef<number>(0);
   const runTickRef = useRef<() => void>(() => {});
 
-  // Ensure candle buffer exists for any symbol (including dynamic coins like SUSHI, RAY, etc.)
+  // Ensure a candle buffer exists for any symbol (including dynamic coins)
   const ensureCandlesForSymbol = useCallback((sym: string, hintPrice?: number) => {
     if (!candlesRef.current[sym] || candlesRef.current[sym].length === 0) {
       const meta = getSymbolMeta(sym, hintPrice);
       const base = hintPrice && hintPrice > 0 ? hintPrice : meta.basePrice;
-      const initialCandles = [];
+      const initialCandles = [] as { open: number; high: number; low: number; close: number; volume: number }[];
       let price = base;
       for (let i = 0; i < 45; i++) {
         const delta = (Math.random() - 0.48) * (base * 0.004);
@@ -219,7 +243,7 @@ export default function App() {
       localStorage.setItem('ultimate_bot_datasource', dataSource);
       localStorage.setItem('ultimate_bot_vps_endpoint', vpsEndpoint);
     } catch (e) {
-      // ignore
+      // storage unavailable (private mode) — non-fatal
     }
   }, [config, dataSource, vpsEndpoint]);
 
@@ -240,7 +264,32 @@ export default function App() {
     setLogs(prev => [...prev.slice(-300), newLog]);
   }, []);
 
-  // Initialize candle buffers for all candidate symbols
+  // UTC-midnight reset of daily PnL & streaks (mirrors the Python engine's daily drawdown reset)
+  useEffect(() => {
+    let lastDay = new Date().toISOString().slice(0, 10);
+    const tick = () => {
+      const key = new Date().toISOString().slice(0, 10);
+      if (key !== lastDay) {
+        lastDay = key;
+        setDailyRealizedPnl(0.0);
+        setWinStreak(0);
+        setLossStreak(0);
+        addLog('INFO', 'RISK', 'UTC midnight reset: daily drawdown counter and streaks cleared.');
+      }
+    };
+    const interval = setInterval(tick, 30_000);
+    return () => clearInterval(interval);
+  }, [addLog]);
+
+  // Track loss-streak cooldown state for the UI banner
+  useEffect(() => {
+    const tick = () => setIsLossCooldown(Date.now() < cooldownUntilRef.current);
+    tick();
+    const interval = setInterval(tick, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Initialize candle buffers
   useEffect(() => {
     Object.keys(INITIAL_SYMBOLS).forEach(sym => {
       ensureCandlesForSymbol(sym);
@@ -269,23 +318,20 @@ export default function App() {
           ...selectedPinnedSymbols
         ]);
 
-        const tickerMap: Record<string, { price: number; change: number; volume: number; high: number; low: number }> = {};
-        data.forEach((item: any) => {
+        const tickerMap: Record<string, { price: number; change: number; volume: number }> = {};
+        for (const item of data) {
           if (currentInterests.has(item.symbol)) {
             const lastP = parseFloat(item.lastPrice);
             ensureCandlesForSymbol(item.symbol, lastP);
             tickerMap[item.symbol] = {
               price: lastP,
               change: parseFloat(item.priceChangePercent),
-              volume: parseFloat(item.quoteVolume),
-              high: parseFloat(item.highPrice),
-              low: parseFloat(item.lowPrice)
+              volume: parseFloat(item.quoteVolume)
             };
           }
-        });
+        }
 
-        Object.keys(tickerMap).forEach(sym => {
-          const t = tickerMap[sym];
+        Object.entries(tickerMap).forEach(([sym, t]) => {
           const existing = candlesRef.current[sym] || [];
           const last = existing[existing.length - 1];
           if (last && Math.abs(last.close - t.price) > 0.00001) {
@@ -306,7 +352,7 @@ export default function App() {
           runTickRef.current();
         }
       } catch (err) {
-        // network or CORS fallback
+        // network or CORS failure — simulator feed remains the fallback
       }
     };
 
@@ -316,7 +362,7 @@ export default function App() {
       isSubscribed = false;
       clearInterval(interval);
     };
-  }, [useLiveBinanceFeed, addLog]);
+  }, [useLiveBinanceFeed, addLog, ensureCandlesForSymbol, selectedPinnedSymbols]);
 
   // Real VPS Data Fetcher (reads SQLite trading.db and PM2 engine state via status.py HTTP endpoint)
   const fetchVpsData = useCallback(async () => {
@@ -348,17 +394,23 @@ export default function App() {
         stats: json.data?.stats
       });
 
-      // Update Risk state from SQLite
-      if (json.data?.risk) {
-        const r = json.data.risk;
-        if (r.daily_pnl !== undefined) {
-          const val = parseFloat(r.daily_pnl || '0');
-          if (!isNaN(val)) setDailyRealizedPnl(val);
-        }
-        if (r.paper_balance !== undefined) {
-          const val = parseFloat(r.paper_balance || '1000');
-          if (!isNaN(val)) setEquity(val);
-        }
+      // Engine control state (web-monitor pause from POST /api/control)
+      if (json.control && typeof json.control.paused === 'boolean') {
+        setVpsControl({
+          paused: json.control.paused,
+          pauseReason: json.control.pause_reason || undefined
+        });
+      }
+
+      // Update Risk state from SQLite. The server's risk_state table is the single
+      // source of truth here — the dashboard never invents simulator numbers in VPS mode.
+      const r = json.data?.risk;
+      const hasDaily = r && r.daily_pnl !== undefined && !isNaN(parseFloat(r.daily_pnl));
+      const hasBalance = r && r.paper_balance !== undefined && !isNaN(parseFloat(r.paper_balance));
+      setVpsRiskAvailable(Boolean(hasDaily || hasBalance));
+      if (r) {
+        if (hasDaily) setDailyRealizedPnl(parseFloat(r.daily_pnl));
+        if (hasBalance) setEquity(parseFloat(r.paper_balance));
         if (r.win_streak !== undefined) {
           const val = parseInt(r.win_streak || '0', 10);
           if (!isNaN(val)) setWinStreak(val);
@@ -475,6 +527,7 @@ export default function App() {
         if (runTickRef.current) runTickRef.current();
       }, 50);
     } catch (err: any) {
+      setVpsRiskAvailable(false);
       setVpsStatus(prev => ({
         ...prev,
         connected: false,
@@ -485,7 +538,7 @@ export default function App() {
     } finally {
       setIsPollingVps(false);
     }
-  }, [dataSource, vpsEndpoint]);
+  }, [dataSource, vpsEndpoint, ensureCandlesForSymbol]);
 
   // Periodic VPS Polling
   useEffect(() => {
@@ -495,8 +548,132 @@ export default function App() {
     return () => clearInterval(interval);
   }, [dataSource, fetchVpsData]);
 
+  // Send a remote control command to the live engine via status.py (POST /api/control)
+  const sendVpsControl = useCallback(async (action: 'pause' | 'resume' | 'close_all' | 'close_symbol', symbol?: string): Promise<boolean> => {
+    const targetBase = (vpsEndpoint || (typeof window !== 'undefined' ? window.location.origin : '')).replace(/\/+$/, '');
+    try {
+      const res = await fetch(`${targetBase}/api/control`, {
+        method: 'POST',
+        mode: 'cors',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, symbol })
+      });
+      const json = await res.json();
+      if (!res.ok || !json.ok) {
+        throw new Error(json.message || `HTTP ${res.status}`);
+      }
+      if (json.control && typeof json.control.paused === 'boolean') {
+        setVpsControl({
+          paused: json.control.paused,
+          pauseReason: json.control.pause_reason || undefined
+        });
+      }
+      return true;
+    } catch (err: any) {
+      addLog('ERROR', 'RISK', `Remote control failed (${action}): ${err.message}`);
+      return false;
+    }
+  }, [vpsEndpoint, addLog]);
+
+  // Pause / resume the live engine from the web monitor
+  const handleToggleVpsPause = useCallback(async () => {
+    const willPause = !vpsControlRef.current.paused;
+    const ok = await sendVpsControl(willPause ? 'pause' : 'resume');
+    if (ok) {
+      addLog('WARN', 'RISK', `Remote engine ${willPause ? 'PAUSED' : 'RESUMED'} from web monitor. ${willPause ? 'New entries blocked — open positions still managed.' : ''}`);
+    }
+  }, [sendVpsControl, addLog]);
+
+  // Push the tuned web configuration to the live engine (POST /api/config)
+  const pushConfigToVps = useCallback(async (): Promise<PushResult> => {
+    const targetBase = (vpsEndpoint || (typeof window !== 'undefined' ? window.location.origin : '')).replace(/\/+$/, '');
+    try {
+      const res = await fetch(`${targetBase}/api/config`, {
+        method: 'POST',
+        mode: 'cors',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ env_file: generateEnvString(configRef.current) })
+      });
+      const json = await res.json();
+      if (!res.ok || !json.ok) {
+        throw new Error(json.message || `HTTP ${res.status}`);
+      }
+      const reloadNote = json.reload?.exit_code === 0
+        ? 'Engine reloaded via PM2 — changes live now.'
+        : (json.reload?.hint || (json.reload?.error ? `Reload note: ${json.reload.error}` : ''));
+      const message = `Applied ${json.count} tunable keys to VPS .env. ${reloadNote}`;
+      setVpsPushResult({ ok: true, message });
+      addLog('SUCCESS', 'SYS', `VPS config pushed: ${(json.applied || []).join(', ')}`);
+      setTimeout(() => fetchVpsData(), 2500);
+      return { ok: true, message };
+    } catch (err: any) {
+      const message = `Push failed: ${err.message}`;
+      setVpsPushResult({ ok: false, message });
+      addLog('ERROR', 'SYS', message);
+      return { ok: false, message };
+    }
+  }, [vpsEndpoint, addLog, fetchVpsData]);
+
+  // Stream the real engine log from the VPS into the Debug Console
+  useEffect(() => {
+    if (dataSource !== 'vps' || !vpsStatus.connected) return;
+
+    const seen = new Set<string>();
+    const targetBase = (vpsEndpoint || (typeof window !== 'undefined' ? window.location.origin : '')).replace(/\/+$/, '');
+    let cancelled = false;
+
+    const fetchEngineLogs = async () => {
+      if (cancelled) return;
+      try {
+        const res = await fetch(`${targetBase}/api/logs?lines=120`, { mode: 'cors' });
+        if (!res.ok) return;
+        const json = await res.json();
+        const lines: string[] = Array.isArray(json.lines) ? json.lines : [];
+        const lineRegex = /^(.+?) - (INFO|WARNING|ERROR|DEBUG|CRITICAL) - (.*)$/;
+        lines.forEach(raw => {
+          const line = raw.trim();
+          const match = lineRegex.exec(line);
+          if (!match) return;
+          const [, , level, message] = match;
+          if (!message.trim()) return;
+          const id = `${level}_${message.slice(0, 80)}`;
+          if (seen.has(id)) return;
+          seen.add(id);
+          const mappedLevel: LogMessage['level'] =
+            level === 'WARNING' ? 'WARN' : level === 'CRITICAL' ? 'ERROR' : (level as LogMessage['level']);
+          addLog(mappedLevel, 'SYS', message.trim());
+        });
+        if (seen.size > 4000) seen.clear();
+      } catch {
+        // Engine log endpoint unreachable — simulator logs remain as fallback.
+      }
+    };
+
+    fetchEngineLogs();
+    const interval = setInterval(fetchEngineLogs, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [dataSource, vpsStatus.connected, vpsEndpoint, addLog]);
+
+  // Switching data source clears locally-simulated trade state so VPS figures
+  // and simulator figures never contaminate each other's display.
+  const handleToggleDataSource = useCallback((source: 'vps' | 'simulator') => {
+    setDataSource(prev => {
+      if (prev !== source) {
+        setActiveTrades([]);
+        setClosedTrades([]);
+        setDailyRealizedPnl(0.0);
+        setEquity(1000.0);
+        setVpsRiskAvailable(false);
+      }
+      return source;
+    });
+  }, []);
+
   // Apply Preset
-  const handleApplyPreset = (preset: StrategyPreset) => {
+  const handleApplyPreset = useCallback((preset: StrategyPreset) => {
     const presetOverrides = PRESET_MAP[preset];
     setConfig(prev => ({
       ...prev,
@@ -504,50 +681,146 @@ export default function App() {
       ...presetOverrides
     }));
     addLog('INFO', 'SYS', `Applied ${preset.toUpperCase()} strategy profile. Timeframe: ${presetOverrides.timeframe}, MTF: ${presetOverrides.mtfTimeframe}`);
-  };
+  }, [addLog]);
 
   // Reset simulation
-  const handleResetSimulation = () => {
+  const handleResetSimulation = useCallback(() => {
     setEquity(1000.0);
     setDailyRealizedPnl(0.0);
     setActiveTrades([]);
     setClosedTrades([]);
     setWinStreak(0);
     setLossStreak(0);
-    addLog('INFO', 'SYS', 'Simulated paper balance reset to $1,000.00 USDT. Trade history cleared.');
-  };
+    cooldownUntilRef.current = 0;
+    cooldownsRef.current = {};
+    addLog('INFO', 'SYS', 'Simulated paper balance reset to $1,000.00 USDT. Trade history, streaks, and cooldowns cleared.');
+  }, [addLog]);
 
-  // Manual Buy simulation
-  const handleTriggerManualBuy = (symbol: string) => {
-    const symData = symbolsData.find(s => s.symbol === symbol);
-    const candles = candlesRef.current[symbol] || [];
-    const lastClose = candles.length > 0 ? candles[candles.length - 1].close : INITIAL_SYMBOLS[symbol]?.basePrice || 100;
-    const price = symData ? symData.price : lastClose;
-    const atr = symData?.factors.atr || price * 0.01;
-    executeTrade(symbol, price, atr, 'MANUAL');
-  };
+  // Close an active trade safely with unique closed ID.
+  // PnL is NET of round-trip taker fees (0.2%) so paper results match live expectations.
+  const handleCloseTrade = useCallback((symbol: string, reason: string, customExitPrice?: number) => {
+    const trade = activeTradesRef.current.find(t => t.symbol === symbol);
+    if (!trade) return;
 
-  // Execute a market buy trade
-  const executeTrade = (symbol: string, currentPrice: number, atr: number, triggerSource: string = 'SIGNAL') => {
+    const exitPrice = customExitPrice ?? trade.currentPrice;
+    const grossPnl = (exitPrice - trade.entryPrice) * trade.quantity;
+    const fees = (trade.entryPrice * trade.quantity + exitPrice * trade.quantity) * TAKER_FEE_RATE;
+    const pnl = grossPnl - fees;
+    const pnlPct = trade.entryPrice > 0 ? (pnl / (trade.entryPrice * trade.quantity)) * 100 : 0;
+
+    const closed: ClosedTrade = {
+      id: `${trade.id}_exit_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      symbol: trade.symbol,
+      side: trade.side,
+      entryPrice: trade.entryPrice,
+      exitPrice,
+      quantity: trade.quantity,
+      pnl,
+      pnlPct,
+      entryTime: trade.entryTime,
+      exitTime: Date.now(),
+      exitReason: reason as any
+    };
+
+    setActiveTrades(prev => prev.filter(t => t.symbol !== symbol));
+
+    // Prevent duplicate closure records for the exact same trade instance
+    setClosedTrades(prev => {
+      if (prev.some(t => t.id === closed.id || (t.symbol === symbol && t.entryTime === trade.entryTime))) {
+        return prev;
+      }
+      return [...prev, closed];
+    });
+
+    setDailyRealizedPnl(prev => prev + pnl);
+    setEquity(prev => prev + pnl);
+
+    if (pnl >= 0) {
+      setWinStreak(prev => prev + 1);
+      setLossStreak(0);
+      addLog('SUCCESS', 'ORDER', `CLOSE ${symbol} (${reason}) - Net PnL: +$${pnl.toFixed(2)} (+${pnlPct.toFixed(2)}%) after $${fees.toFixed(2)} fees`, symbol);
+    } else {
+      const newStreak = lossStreakRef.current + 1;
+      setLossStreak(newStreak);
+      setWinStreak(0);
+      addLog('WARN', 'ORDER', `CLOSE ${symbol} (${reason}) - Net PnL: -$${Math.abs(pnl).toFixed(2)} (${pnlPct.toFixed(2)}%) after $${fees.toFixed(2)} fees`, symbol);
+      // Engage global cooldown when the loss-streak limit is hit (mirrors the Python engine)
+      if (newStreak >= configRef.current.maxLossStreak) {
+        cooldownUntilRef.current = Date.now() + configRef.current.cooldownLoss * 1000;
+        setCooldownEndsAt(cooldownUntilRef.current);
+        addLog('WARN', 'RISK', `Loss streak ${newStreak}/${configRef.current.maxLossStreak} — trading PAUSED for ${Math.round(configRef.current.cooldownLoss / 60)} min (COOLDOWN_LOSS).`);
+      }
+    }
+
+    // Short per-symbol re-entry cooldown (mirrors self.symbol_cooldowns in trade_logic.py)
+    cooldownsRef.current[symbol] = Date.now() + 10_000;
+  }, [addLog]);
+
+  // Emergency Close All Trades — remotely liquidates the live engine when in
+  // VPS mode, otherwise closes the local simulator positions.
+  const handleCloseAllTrades = useCallback(async () => {
+    if (dataSourceRef.current === 'vps' && vpsStatusRef.current.connected) {
+      const ok = await sendVpsControl('close_all');
+      if (ok) {
+        addLog('WARN', 'RISK', 'EMERGENCY LIQUIDATION requested on VPS engine — closing all open positions.');
+      }
+      return;
+    }
+    const open = activeTradesRef.current;
+    if (open.length === 0) return;
+    open.forEach(t => handleCloseTrade(t.symbol, 'EMERGENCY_CLOSE'));
+    addLog('WARN', 'RISK', `EMERGENCY LIQUIDATION: Closed all ${open.length} open market positions.`);
+  }, [handleCloseTrade, addLog, sendVpsControl]);
+
+  // Execute a market buy trade (Simulator mode only — the real engine lives on the VPS)
+  const executeTrade = useCallback((symbol: string, currentPrice: number, atr: number, triggerSource: string = 'SIGNAL') => {
+    if (dataSourceRef.current === 'vps') {
+      addLog('WARN', 'ORDER', `${symbol}: manual entries are disabled while synced to the live VPS engine. Switch to Strategy Simulator for testing.`, symbol);
+      return;
+    }
+
     // Check max open trades
-    if (activeTrades.length >= config.maxSymbols) {
-      addLog('WARN', 'ORDER', `Max open trades reached (${activeTrades.length}/${config.maxSymbols}). Skipping ${symbol}.`, symbol);
+    if (activeTradesRef.current.length >= configRef.current.maxSymbols) {
+      addLog('WARN', 'ORDER', `Max open trades reached (${activeTradesRef.current.length}/${configRef.current.maxSymbols}). Skipping ${symbol}.`, symbol);
       return;
     }
 
     // Check if already open
-    if (activeTrades.some(t => t.symbol === symbol)) {
+    if (activeTradesRef.current.some(t => t.symbol === symbol)) {
       addLog('DEBUG', 'ORDER', `${symbol} already has an active position. Skipping duplicate entry.`, symbol);
       return;
     }
 
-    // Position sizing: allocate up to maxSymbolAllocationPercent
-    const allocation = Math.min(equity * config.balanceUsagePercent, equity * config.maxSymbolAllocationPercent);
+    // Loss-streak cooldown gate (mirrors MAX_LOSS_STREAK / COOLDOWN_LOSS in the Python engine)
+    if (Date.now() < cooldownUntilRef.current) {
+      const remaining = Math.ceil((cooldownUntilRef.current - Date.now()) / 1000);
+      addLog('WARN', 'RISK', `Loss-streak cooldown ACTIVE. Entries paused for another ${remaining}s.`, symbol);
+      return;
+    }
+
+    // Per-symbol re-entry cooldown
+    const symCooldown = cooldownsRef.current[symbol] || 0;
+    if (Date.now() < symCooldown) {
+      addLog('DEBUG', 'ORDER', `${symbol} in re-entry cooldown for ${Math.ceil((symCooldown - Date.now()) / 1000)}s.`, symbol);
+      return;
+    }
+
+    // Position sizing: capped by BOTH total usage and per-symbol allocation,
+    // with a 1% safety buffer for taker fees (mirrors the live engine's free-quote guard).
+    const curEquity = equityRef.current;
+    const allocation = effectiveAllocation(configRef.current, curEquity);
+
+    // Binance rejects orders below MIN_NOTIONAL — skip instead of sizing up.
+    if (allocation < MIN_NOTIONAL_USDT || curEquity < MIN_NOTIONAL_USDT) {
+      addLog('WARN', 'ORDER', `${symbol}: allocation $${allocation.toFixed(2)} below Binance MIN_NOTIONAL ($${MIN_NOTIONAL_USDT}). Order would be rejected live — skipped.`, symbol);
+      return;
+    }
+
     const quantity = allocation / currentPrice;
     const notional = quantity * currentPrice;
 
-    const stopPrice = currentPrice - atr * config.atrMultiplierSl;
-    let takeProfit = currentPrice + atr * config.atrMultiplierTp;
+    const stopPrice = currentPrice - atr * configRef.current.atrMultiplierSl;
+    let takeProfit = currentPrice + atr * configRef.current.atrMultiplierTp;
     const minTpDist = currentPrice * 0.005;
     if (takeProfit - currentPrice < minTpDist) {
       takeProfit = currentPrice + minTpDist;
@@ -579,99 +852,20 @@ export default function App() {
       `ENTRY MARKET BUY ${quantity.toFixed(4)} ${symbol} @ $${currentPrice.toFixed(2)} [SL: $${stopPrice.toFixed(2)}, TP: $${takeProfit.toFixed(2)}] (${triggerSource})`,
       symbol
     );
-  };
+  }, [addLog]);
 
-  // Close an active trade safely with unique closed ID
-  const handleCloseTrade = (symbol: string, reason: string, customExitPrice?: number) => {
-    setActiveTrades(prevTrades => {
-      const trade = prevTrades.find(t => t.symbol === symbol);
-      if (!trade) return prevTrades;
-
-      const exitPrice = customExitPrice ?? trade.currentPrice;
-      const pnl = (exitPrice - trade.entryPrice) * trade.quantity;
-      const pnlPct = ((exitPrice - trade.entryPrice) / trade.entryPrice) * 100;
-
-      const closed: ClosedTrade = {
-        id: `${trade.id}_exit_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-        symbol: trade.symbol,
-        side: trade.side,
-        entryPrice: trade.entryPrice,
-        exitPrice,
-        quantity: trade.quantity,
-        pnl,
-        pnlPct,
-        entryTime: trade.entryTime,
-        exitTime: Date.now(),
-        exitReason: reason as any
-      };
-
-      setClosedTrades(prev => {
-        // Prevent duplicate closure records for the exact same trade instance
-        if (prev.some(t => t.id === closed.id || (t.symbol === symbol && t.entryTime === trade.entryTime))) {
-          return prev;
-        }
-        return [...prev, closed];
-      });
-
-      setDailyRealizedPnl(prev => prev + pnl);
-      setEquity(prev => prev + pnl);
-
-      if (pnl >= 0) {
-        setWinStreak(prev => prev + 1);
-        setLossStreak(0);
-        addLog('SUCCESS', 'ORDER', `CLOSE ${symbol} (${reason}) - PnL: +$${pnl.toFixed(2)} (+${pnlPct.toFixed(2)}%)`, symbol);
-      } else {
-        setLossStreak(prev => prev + 1);
-        setWinStreak(0);
-        addLog('WARN', 'ORDER', `CLOSE ${symbol} (${reason}) - PnL: -$${Math.abs(pnl).toFixed(2)} (${pnlPct.toFixed(2)}%)`, symbol);
-      }
-
-      return prevTrades.filter(t => t.symbol !== symbol);
-    });
-  };
-
-  // Emergency Close All Trades
-  const handleCloseAllTrades = () => {
-    setActiveTrades(prevTrades => {
-      if (prevTrades.length === 0) return prevTrades;
-
-      prevTrades.forEach(t => {
-        const exitPrice = t.currentPrice;
-        const pnl = (exitPrice - t.entryPrice) * t.quantity;
-        const pnlPct = ((exitPrice - t.entryPrice) / t.entryPrice) * 100;
-
-        const closed: ClosedTrade = {
-          id: `${t.id}_exit_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-          symbol: t.symbol,
-          side: t.side,
-          entryPrice: t.entryPrice,
-          exitPrice,
-          quantity: t.quantity,
-          pnl,
-          pnlPct,
-          entryTime: t.entryTime,
-          exitTime: Date.now(),
-          exitReason: 'EMERGENCY_CLOSE'
-        };
-
-        setClosedTrades(prev => {
-          if (prev.some(ct => ct.id === closed.id || (ct.symbol === t.symbol && ct.entryTime === t.entryTime))) {
-            return prev;
-          }
-          return [...prev, closed];
-        });
-
-        setDailyRealizedPnl(prev => prev + pnl);
-        setEquity(prev => prev + pnl);
-      });
-
-      addLog('WARN', 'RISK', `EMERGENCY LIQUIDATION: Closed all ${prevTrades.length} open market positions.`);
-      return [];
-    });
-  };
+  // Manual Buy simulation
+  const handleTriggerManualBuy = useCallback((symbol: string) => {
+    const symData = symbolsData.find(s => s.symbol === symbol);
+    const candles = candlesRef.current[symbol] || [];
+    const lastClose = candles.length > 0 ? candles[candles.length - 1].close : INITIAL_SYMBOLS[symbol]?.basePrice || 100;
+    const price = symData ? symData.price : lastClose;
+    const atr = symData?.factors.atr || price * 0.01;
+    executeTrade(symbol, price, atr, 'MANUAL');
+  }, [symbolsData, executeTrade]);
 
   // Simulate Institutional Confluence Boost
-  const handleSimulateConfluenceBoost = (symbol: string) => {
+  const handleSimulateConfluenceBoost = useCallback((symbol: string) => {
     const candles = candlesRef.current[symbol] || [];
     if (candles.length === 0) return;
     const last = candles[candles.length - 1];
@@ -685,19 +879,18 @@ export default function App() {
     };
     candlesRef.current[symbol] = [...candles.slice(-80), boosted];
     addLog('INFO', 'SIGNAL', `SIMULATION: Injected institutional buyer volume into ${symbol} (+1.5% jump, 6x volume, positive CVD). Confluence triggered!`, symbol);
-  };
+  }, [addLog]);
 
   // Toggle Symbol Selection in Screener
-  const handleToggleSymbolSelect = (symbol: string) => {
+  const handleToggleSymbolSelect = useCallback((symbol: string) => {
     setSelectedPinnedSymbols(prev => {
       if (prev.includes(symbol)) {
         return prev.filter(s => s !== symbol);
-      } else {
-        return [...prev, symbol];
       }
+      return [...prev, symbol];
     });
     addLog('INFO', 'SYS', `Updated watchlist selection for ${symbol}.`);
-  };
+  }, [addLog]);
 
   // Main Bot Tick, Dynamic Screener, and Evaluation Routine
   const runTick = useCallback(() => {
@@ -706,9 +899,9 @@ export default function App() {
     const curActiveTrades = activeTradesRef.current;
     const curEquity = equityRef.current;
     const curDailyPnl = dailyRealizedPnlRef.current;
+    const now = Date.now();
 
-    // 1. Gather ALL candidate symbols:
-    // master list + active trades (e.g. SUSHI, RAY) + static symbols + pinned screener symbols
+    // 1. Gather ALL candidate symbols
     const allCandidateKeys = Array.from(new Set([
       ...Object.keys(INITIAL_SYMBOLS),
       ...curActiveTrades.map(t => t.symbol),
@@ -727,13 +920,13 @@ export default function App() {
 
       // Price drift simulation (if not on direct live feed)
       let newClose = lastClose;
-      let volume = 30 + Math.random() * 20;
       if (!useLiveBinanceFeed) {
         const drift = (Math.random() - 0.49) * (lastClose * 0.002);
         newClose = Math.max(0.00001, lastClose + drift);
         const open = lastClose;
         const high = Math.max(open, newClose) + Math.random() * (lastClose * 0.001);
         const low = Math.min(open, newClose) - Math.random() * (lastClose * 0.001);
+        const volume = 30 + Math.random() * 20;
         const newCandle = { open, high, low, close: newClose, volume };
         candlesRef.current[sym] = [...candles.slice(-80), newCandle];
       }
@@ -741,8 +934,6 @@ export default function App() {
       const priceChange24h = base > 0 ? ((newClose - base) / base) * 100 : 0;
       const volatility = Math.abs(priceChange24h) * 0.01 + 0.015;
       const adx = 20 + (Math.abs(priceChange24h) * 2) + (Math.random() * 5);
-
-      // Approximate 24h Volume in USDT
       const volume24h = 10_000_000 + (Math.abs(priceChange24h) * 2_000_000) + (base * 1000);
 
       evaluatedCandidates.push({
@@ -759,7 +950,7 @@ export default function App() {
       });
     });
 
-    // Compute multi-factor composite Z-scores
+    // Compute multi-factor composite Z-scores (weights mirror the Python TrendDetector)
     if (evaluatedCandidates.length > 0) {
       const meanVol = evaluatedCandidates.reduce((a, c) => a + c.volume24h, 0) / evaluatedCandidates.length;
       const meanChg = evaluatedCandidates.reduce((a, c) => a + c.priceChange24h, 0) / evaluatedCandidates.length;
@@ -772,7 +963,6 @@ export default function App() {
         c.zScore = 0.20 * zVol + 0.20 * zChg + 0.20 * (c.volatility * 20) + 0.40 * zAdx;
       });
 
-      // Sort candidates by Z-Score descending
       evaluatedCandidates.sort((a, b) => b.zScore - a.zScore);
       evaluatedCandidates.forEach((c, idx) => {
         c.momentumRank = idx + 1;
@@ -785,7 +975,6 @@ export default function App() {
     setCandidates(evaluatedCandidates);
 
     // Determine which symbols are actively monitored by the trading engine
-    // GUARANTEE: Monitored list always has symbols, and also includes any open trades
     const openTradeSymbols = curActiveTrades.map(t => t.symbol);
     const chosenList = curConfig.dynamicSymbols
       ? evaluatedCandidates.filter(c => c.isSelected).slice(0, curConfig.maxSymbols).map(c => c.symbol)
@@ -793,8 +982,6 @@ export default function App() {
 
     // Merge chosenList with any open trades so the user always sees their open positions
     const activeSymbolList = Array.from(new Set([...chosenList, ...openTradeSymbols]));
-
-    // Fallback if somehow empty
     const finalSymbolList = activeSymbolList.length > 0 ? activeSymbolList : ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'];
 
     // 2. Compute 5-factor analysis for monitored symbols
@@ -817,7 +1004,7 @@ export default function App() {
         volume24h: 15_000_000 + Math.random() * 2_000_000,
         factors,
         sparkline,
-        inCooldown: false
+        inCooldown: (cooldownsRef.current[sym] || 0) > now
       };
     });
 
@@ -841,7 +1028,7 @@ export default function App() {
       return;
     }
 
-    // 3. Manage Active Trades (Price updates, Trailing Stop, Breakeven, SL, TP) - Simulator Mode Only
+    // 3. Manage Active Trades (Simulator Mode Only): SL/TP, trailing, breakeven, time stop
     const tradesToClose: { symbol: string; reason: string; exitPrice?: number }[] = [];
 
     setActiveTrades(prevTrades => {
@@ -860,19 +1047,18 @@ export default function App() {
         const pnlPct = trade.entryPrice > 0 ? ((livePrice - trade.entryPrice) / trade.entryPrice) * 100 : 0;
         const profitPct = trade.entryPrice > 0 ? (livePrice - trade.entryPrice) / trade.entryPrice : 0;
 
-        // Check Stop Loss
+        // Gap-breach SL check: exit at the worse of stop or current price (mirrors the Python engine)
         if (livePrice <= stopPrice) {
-          tradesToClose.push({ symbol: trade.symbol, reason: 'STOP_LOSS', exitPrice: stopPrice });
+          tradesToClose.push({ symbol: trade.symbol, reason: 'STOP_LOSS', exitPrice: Math.min(stopPrice, livePrice) });
           return;
         }
 
-        // Check Take Profit
         if (livePrice >= trade.takeProfit) {
           tradesToClose.push({ symbol: trade.symbol, reason: 'TAKE_PROFIT', exitPrice: trade.takeProfit });
           return;
         }
 
-        // Check Trailing Stop Activation
+        // Trailing Stop Activation
         if (!trailingActive && profitPct >= curConfig.trailingStopActivate) {
           trailingActive = true;
           trailingStop = stopPrice;
@@ -890,15 +1076,15 @@ export default function App() {
           }
         }
 
-        // Check Breakeven lock (+1.0%)
+        // Fee-aware Breakeven lock (entry + 0.25% covers round-trip fees — mirrors the engine)
         if (!breakevenActivated && profitPct >= 0.01) {
           breakevenActivated = true;
-          stopPrice = trade.entryPrice * 1.0025;
+          stopPrice = trade.entryPrice * BREAKEVEN_FEE_MULTIPLIER;
           addLog('INFO', 'ORDER', `Breakeven lock ENGAGED for ${trade.symbol} (+1.0% profit). Stop raised to entry+fees.`, trade.symbol);
         }
 
-        // Check Max Hold Time
-        if ((Date.now() - trade.entryTime) / 1000 > curConfig.maxHoldTime) {
+        // Max Hold Time
+        if ((now - trade.entryTime) / 1000 > curConfig.maxHoldTime) {
           tradesToClose.push({ symbol: trade.symbol, reason: 'TIME_STOP', exitPrice: livePrice });
           return;
         }
@@ -918,12 +1104,17 @@ export default function App() {
       return remainingTrades;
     });
 
-    // Execute closures cleanly outside of the setActiveTrades updater function
+    // Execute closures cleanly outside of the setActiveTrades updater
     tradesToClose.forEach(({ symbol, reason, exitPrice }) => {
       handleCloseTrade(symbol, reason, exitPrice);
     });
 
     // 4. Confluence Evaluation & Execution
+    const drawdownExceeded = curEquity > 0 && curDailyPnl <= -curConfig.maxDailyDrawdown * curEquity;
+    if (drawdownExceeded) {
+      addLog('WARN', 'RISK', `Max daily drawdown exceeded (${(curConfig.maxDailyDrawdown * 100).toFixed(1)}%). All new entries blocked until UTC reset.`);
+    }
+
     updatedSymbols.forEach(sym => {
       const f = sym.factors;
       const hasActive = curActiveTrades.some(t => t.symbol === sym.symbol);
@@ -933,12 +1124,7 @@ export default function App() {
         return;
       }
 
-      // Drawdown check
-      const totalPnl = curDailyPnl;
-      if (curEquity > 0 && totalPnl <= -curConfig.maxDailyDrawdown * curEquity) {
-        addLog('WARN', 'RISK', `Max daily drawdown exceeded (${(-curConfig.maxDailyDrawdown * 100).toFixed(1)}%). Entry blocked for ${sym.symbol}.`, sym.symbol);
-        return;
-      }
+      if (drawdownExceeded) return;
 
       // Confluence check
       const meetsThreshold = f.bullishScore >= curConfig.signalThreshold;
@@ -967,11 +1153,10 @@ export default function App() {
     runTickRef.current = runTick;
   }, [runTick]);
 
-  // Main Bot Tick, Dynamic Screener, and Simulation Loop
+  // Main Bot Tick Loop
   useEffect(() => {
     if (!isRunning) return;
 
-    // Run tick immediately upon mounting or parameter change
     runTick();
 
     const interval = setInterval(() => {
@@ -983,7 +1168,10 @@ export default function App() {
     return () => clearInterval(interval);
   }, [isRunning, config.signalInterval, runTick]);
 
-  const totalUnrealizedPnl = activeTrades.reduce((acc, t) => acc + t.unrealizedPnl, 0);
+  const totalUnrealizedPnl = useMemo(
+    () => activeTrades.reduce((acc, t) => acc + t.unrealizedPnl, 0),
+    [activeTrades]
+  );
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col selection:bg-amber-500/30 selection:text-amber-200">
@@ -1000,17 +1188,20 @@ export default function App() {
         totalEquity={equity + totalUnrealizedPnl}
         dataSource={dataSource}
         vpsConnected={vpsStatus.connected}
+        isLossCooldown={isLossCooldown}
       />
 
       {/* Live VPS Connection Bar */}
       <VpsConnectionBar
         dataSource={dataSource}
-        onToggleDataSource={setDataSource}
+        onToggleDataSource={handleToggleDataSource}
         vpsStatus={vpsStatus}
         vpsEndpoint={vpsEndpoint}
         onUpdateVpsEndpoint={setVpsEndpoint}
         onRefreshVps={fetchVpsData}
         isPolling={isPollingVps}
+        controlPaused={vpsControl.paused}
+        onToggleVpsPause={handleToggleVpsPause}
       />
 
       {/* Main Content Area */}
@@ -1036,6 +1227,15 @@ export default function App() {
             onToggleLiveBinanceFeed={() => setUseLiveBinanceFeed(prev => !prev)}
             winStreak={winStreak}
             lossStreak={lossStreak}
+            dataSource={dataSource}
+            vpsRiskAvailable={vpsRiskAvailable}
+            isLossCooldown={isLossCooldown}
+            cooldownEndsAt={cooldownEndsAt}
+            vpsConnected={vpsStatus.connected}
+            onPushConfigToVps={pushConfigToVps}
+            vpsPushResult={vpsPushResult}
+            controlPaused={vpsControl.paused}
+            onToggleVpsPause={handleToggleVpsPause}
           />
         )}
 
@@ -1065,6 +1265,9 @@ export default function App() {
             config={config}
             onUpdateConfig={setConfig}
             onApplyPreset={handleApplyPreset}
+            dataSource={dataSource}
+            vpsConnected={vpsStatus.connected}
+            onPushToVps={pushConfigToVps}
           />
         )}
 

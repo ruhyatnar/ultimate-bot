@@ -41,7 +41,9 @@ class HealthCheck:
             if self.ws_stream and not self.ws_stream.is_connected():
                 await self.reconnect("ws_stream")
         try:
-            await self.db.execute("SELECT 1")
+            # fetch_one goes through the dedicated read connection, so this is a
+            # real liveness probe (execute() only enqueues onto the write queue).
+            await self.db.fetch_one("SELECT 1")
         except Exception as e:
             self.logger.error(f"DB health check failed: {e}")
 

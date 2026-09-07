@@ -135,3 +135,13 @@ export interface VpsBotStatus {
     win_rate: number;
   };
 }
+
+export interface VpsControlState {
+  paused: boolean;
+  pauseReason?: string;
+}
+
+export interface PushResult {
+  ok: boolean;
+  message: string;
+}

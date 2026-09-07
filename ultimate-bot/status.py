@@ -9,13 +9,18 @@ Usage:
 """
 
 import os
+import re
 import sys
 import time
 import json
+import uuid
 import sqlite3
 import argparse
+import shutil
+import subprocess
 from datetime import datetime
 from http.server import HTTPServer, SimpleHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
 # ANSI Color Codes for Debian CLI
 GREEN = "\033[92m"
@@ -38,6 +43,104 @@ def load_env(env_path=".env"):
                     k, v = line.split("=", 1)
                     config[k.strip()] = v.strip()
     return config
+
+# Keys the interactive web monitor is allowed to write into .env.
+# Secrets (API key, private key path, webhook URL) are intentionally excluded
+# so a browser-facing endpoint can never overwrite credentials.
+TUNING_KEYS = {
+    "PAPER_TRADE", "USE_TESTNET", "PRESET", "TIMEFRAME", "MTF_TIMEFRAME",
+    "ATR_PERIOD", "ATR_MULTIPLIER_SL", "ATR_MULTIPLIER_TP",
+    "TRAILING_STOP_ACTIVATE", "TRAILING_STOP_CALLBACK", "SWING_LOOKBACK",
+    "MAX_HOLD_TIME", "SIGNAL_THRESHOLD", "SIGNAL_INTERVAL",
+    "BALANCE_USAGE_PERCENT", "MAX_SYMBOL_ALLOCATION_PERCENT",
+    "MAX_DAILY_DRAWDOWN", "MAX_LOSS_STREAK", "MAX_WIN_STREAK",
+    "COOLDOWN_LOSS", "COOLDOWN_WIN", "MAX_SLIPPAGE_PERCENT", "MIN_TP_PERCENT",
+    "DYNAMIC_SYMBOLS", "MAX_SYMBOLS", "STATIC_SYMBOLS", "QUOTE_ASSET",
+    "EXCLUDE_SYMBOLS", "ADX_THRESHOLD", "ADX_PERIOD", "TOP_CANDIDATES",
+    "MIN_VOLUME_USDT", "MIN_PRICE_CHANGE_PERCENT", "MIN_VOLATILITY_PERCENT",
+    "Z_SCORE_WEIGHT_VOLUME", "Z_SCORE_WEIGHT_CHANGE",
+    "Z_SCORE_WEIGHT_VOLATILITY", "Z_SCORE_WEIGHT_ADX",
+    "CORRELATION_THRESHOLD", "CORRELATION_PENALTY", "TREND_LOOKBACK",
+    "SYMBOL_REFRESH_INTERVAL", "DB_PATH", "CONTROL_FILE", "DISCORD_COOLDOWN",
+    "LOG_LEVEL", "LOG_FILE", "HEALTH_CHECK_INTERVAL", "REST_WEIGHT_LIMIT",
+    "ENTRY_TIMEOUT", "AUTO_LIQUIDATE_ORPHANS",
+}
+
+
+def read_control(control_path):
+    """Read the engine control file (pause/close commands) written by the web monitor."""
+    try:
+        with open(control_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_control(control_path, data):
+    """Atomically persist engine control state."""
+    os.makedirs(os.path.dirname(control_path) or ".", exist_ok=True)
+    tmp = control_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, control_path)
+
+
+def parse_env_payload(payload):
+    """Parse generated .env file content into a whitelist-filtered {KEY: value} map."""
+    updates = {}
+    for line in payload.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k in TUNING_KEYS:
+            updates[k] = v.strip()
+    return updates
+
+
+def apply_env_updates(env_path, updates):
+    """Merge whitelisted KEY=VALUE updates into .env atomically.
+    Preserves comments and unrelated lines; returns the applied keys."""
+    applied = []
+    if not os.path.exists(env_path):
+        return applied
+    with open(env_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    out = []
+    seen = set()
+    for line in lines:
+        stripped = line.strip()
+        m = re.match(r"^([A-Z0-9_]+)=", stripped)
+        key = m.group(1) if m else None
+        if key in updates:
+            if key not in seen:
+                out.append(f"{key}={updates[key]}\n")
+                seen.add(key)
+                applied.append(key)
+            continue
+        out.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            out.append(f"{key}={value}\n")
+            seen.add(key)
+            applied.append(key)
+    tmp = env_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(out)
+    os.replace(tmp, env_path)
+    return applied
+
+
+def tail_log_file(log_path, lines=120):
+    """Return the last `lines` lines of the engine log file."""
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            return f.readlines()[-lines:]
+    except Exception:
+        return []
+
 
 def get_process_status():
     lock_file = "/tmp/ultimate_bot.lock"
@@ -307,6 +410,28 @@ def start_web_server(port, env_config, db_path):
             self.send_cors_headers()
             self.end_headers()
 
+        def _send_json(self, obj, status=200):
+            data_bytes = json.dumps(obj, default=str).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_cors_headers()
+            self.send_header("Content-Length", str(len(data_bytes)))
+            self.end_headers()
+            self.wfile.write(data_bytes)
+
+        def _read_json_body(self):
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+            except ValueError:
+                return None
+            if length <= 0 or length > 1_000_000:
+                return None
+            raw = self.rfile.read(length)
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except Exception:
+                return None
+
         def do_GET(self):
             clean_path = self.path.split("?")[0]
             if clean_path in ["/api/status", "/api"]:
@@ -314,20 +439,31 @@ def start_web_server(port, env_config, db_path):
                 status_str = get_process_status()
                 clean_status = status_str.replace(GREEN, "").replace(RED, "").replace(YELLOW, "").replace(RESET, "")
                 safe_config = {k: v for k, v in env_config.items() if "KEY" not in k and "SECRET" not in k and "WEBHOOK" not in k}
+                control = read_control(env_config.get("CONTROL_FILE", "./data/engine_control.json"))
                 payload = {
                     "process": clean_status,
                     "config": safe_config,
                     "data": db_data,
+                    "control": {
+                        "paused": bool(control.get("paused", False)),
+                        "pause_reason": control.get("pause_reason", "") or ""
+                    },
                     "server_time": datetime.now().isoformat(),
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
-                data_bytes = json.dumps(payload, default=str).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_cors_headers()
-                self.send_header("Content-Length", str(len(data_bytes)))
-                self.end_headers()
-                self.wfile.write(data_bytes)
+                self._send_json(payload)
+                return
+
+            if clean_path == "/api/logs":
+                # Stream the engine's own log file so the web Debug Console shows
+                # the real VPS process output, not a local simulation.
+                query = parse_qs(urlparse(self.path).query)
+                try:
+                    lines = min(int(query.get("lines", ["120"])[0]), 500)
+                except ValueError:
+                    lines = 120
+                log_path = env_config.get("LOG_FILE", "./logs/trading.log")
+                self._send_json({"lines": tail_log_file(log_path, lines)})
                 return
 
             if clean_path == "/api/health":
@@ -373,6 +509,78 @@ def start_web_server(port, env_config, db_path):
                 self.send_header("Content-Length", str(len(html_bytes)))
                 self.end_headers()
                 self.wfile.write(html_bytes)
+
+        def do_POST(self):
+            """Interactive control surface for the web monitor:
+            - POST /api/control  {"action": pause|resume|close_all|close_symbol, "symbol": "..."}
+            - POST /api/config   {"env_file": "<generated .env content>"}
+            """
+            clean_path = self.path.split("?")[0]
+            body = self._read_json_body()
+            if body is None:
+                self._send_json({"ok": False, "message": "Invalid or missing JSON body."}, status=400)
+                return
+
+            if clean_path == "/api/control":
+                control_path = env_config.get("CONTROL_FILE", "./data/engine_control.json")
+                control = read_control(control_path)
+                action = body.get("action")
+                if action == "pause":
+                    control["paused"] = True
+                    control["pause_reason"] = body.get("reason", "paused from web monitor")
+                elif action == "resume":
+                    control["paused"] = False
+                    control.pop("pause_reason", None)
+                elif action == "close_all":
+                    control["close_all"] = True
+                    control["command_id"] = str(uuid.uuid4())
+                elif action == "close_symbol":
+                    symbol = str(body.get("symbol", "")).strip().upper()
+                    if not symbol:
+                        self._send_json({"ok": False, "message": "symbol is required for close_symbol"}, status=400)
+                        return
+                    control["close_symbol"] = symbol
+                    control["command_id"] = str(uuid.uuid4())
+                else:
+                    self._send_json({"ok": False, "message": f"Unknown action: {action}"}, status=400)
+                    return
+                write_control(control_path, control)
+                public_control = {k: v for k, v in control.items() if k != "command_id"}
+                self._send_json({"ok": True, "action": action, "control": public_control})
+                return
+
+            if clean_path == "/api/config":
+                raw = body.get("env_file")
+                if not isinstance(raw, str) or not raw.strip():
+                    self._send_json({"ok": False, "message": "env_file content is required"}, status=400)
+                    return
+                updates = parse_env_payload(raw)
+                if not updates:
+                    self._send_json({"ok": False, "message": "No whitelisted tunable keys found in payload"}, status=400)
+                    return
+                env_path = os.path.abspath(".env")
+                applied = apply_env_updates(env_path, updates)
+                result = {"ok": True, "applied": applied, "count": len(applied)}
+                # Gracefully reload the engine so tuning takes effect immediately.
+                if applied and shutil.which("pm2"):
+                    try:
+                        proc = subprocess.run(
+                            ["pm2", "reload", "ultimate-bot"],
+                            capture_output=True, text=True, timeout=25
+                        )
+                        out = (proc.stdout or proc.stderr or "").strip()[-500:]
+                        result["reload"] = {"attempted": True, "exit_code": proc.returncode, "output": out}
+                    except Exception as e:
+                        result["reload"] = {"attempted": True, "error": str(e)}
+                else:
+                    result["reload"] = {
+                        "attempted": False,
+                        "hint": "pm2 not detected — run 'pm2 reload ultimate-bot' (or restart the engine) to apply."
+                    }
+                self._send_json(result)
+                return
+
+            self._send_json({"ok": False, "message": f"Unknown endpoint: {clean_path}"}, status=404)
 
     server = HTTPServer(("0.0.0.0", port), CustomHandler)
     print(f"{GREEN}{BOLD}⚡ Binance Bot Web Monitor running at:{RESET}")

@@ -4,18 +4,13 @@ import {
   TrendingDown, 
   Shield, 
   DollarSign, 
-  Percent, 
   Crosshair, 
   Clock, 
-  AlertTriangle, 
   ArrowUpRight, 
   ArrowDownRight,
   Sparkles,
-  CheckCircle2,
-  XCircle,
   Zap,
-  Info,
-  Maximize2
+  PauseCircle
 } from 'lucide-react';
 import { 
   ActiveTrade, 
@@ -23,7 +18,8 @@ import {
   MarketSymbolData, 
   BotConfig, 
   StrategyPreset,
-  CandidateSymbol 
+  CandidateSymbol,
+  PushResult 
 } from '../types';
 import { TuningControlBar } from './TuningControlBar';
 import { DynamicScreener } from './DynamicScreener';
@@ -50,6 +46,15 @@ interface LiveDashboardProps {
   onToggleLiveBinanceFeed: () => void;
   winStreak: number;
   lossStreak: number;
+  dataSource?: 'vps' | 'simulator';
+  vpsRiskAvailable?: boolean;
+  isLossCooldown?: boolean;
+  cooldownEndsAt?: number;
+  vpsConnected?: boolean;
+  onPushConfigToVps?: () => Promise<PushResult>;
+  vpsPushResult?: PushResult | null;
+  controlPaused?: boolean;
+  onToggleVpsPause?: () => void;
 }
 
 export const LiveDashboard: React.FC<LiveDashboardProps> = ({
@@ -71,7 +76,16 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
   useLiveBinanceFeed,
   onToggleLiveBinanceFeed,
   winStreak,
-  lossStreak
+  lossStreak,
+  dataSource = 'vps',
+  vpsRiskAvailable = false,
+  isLossCooldown = false,
+  cooldownEndsAt = 0,
+  vpsConnected = false,
+  onPushConfigToVps,
+  vpsPushResult = null,
+  controlPaused = false,
+  onToggleVpsPause
 }) => {
   const [inspectedSymbol, setInspectedSymbol] = useState<string | null>(null);
   const [showVpsSync, setShowVpsSync] = useState<boolean>(false);
@@ -118,8 +132,27 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
       }
     : null;
 
+  const showServerEquity = dataSource === 'vps' && !vpsRiskAvailable;
+  const equityLabel = showServerEquity
+    ? 'Server Equity'
+    : config.paperTrade
+      ? 'Simulated Paper Equity'
+      : 'Live Spot Equity';
+
   return (
     <div className="space-y-6">
+      {/* Loss-Streak Cooldown Banner (mirrors COOLDOWN_LOSS in the Python engine) */}
+      {isLossCooldown && (
+        <div className="flex items-center justify-between p-3 rounded-lg bg-rose-950/50 border border-rose-500/40 animate-pulse">
+          <div className="flex items-center space-x-2 text-xs text-rose-200">
+            <PauseCircle className="w-4 h-4 text-rose-400" />
+            <span>
+              <strong>Trading Paused — Loss-Streak Cooldown.</strong> Entries blocked until {new Date(cooldownEndsAt).toLocaleTimeString()} (COOLDOWN_LOSS).
+            </span>
+          </div>
+        </div>
+      )}
+
       {/* Interactive Quick Tuner Bar */}
       <TuningControlBar
         config={config}
@@ -132,28 +165,42 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
         onToggleLiveBinanceFeed={onToggleLiveBinanceFeed}
         activeSymbols={symbolsData.map(s => s.symbol)}
         activeTradesCount={activeTrades.length}
+        vpsConnected={vpsConnected}
+        controlPaused={controlPaused}
+        onToggleVpsPause={onToggleVpsPause}
       />
 
       {/* Risk & Performance Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        {/* Total Paper Equity */}
+        {/* Total Equity (simulator or server-synced) */}
         <div className="bg-slate-800/80 border border-slate-700/60 rounded-xl p-4 shadow-sm relative overflow-hidden">
           <div className="flex items-center justify-between text-xs text-slate-400 font-medium">
-            <span>Simulated Paper Equity</span>
+            <span>{equityLabel}</span>
             <DollarSign className="w-4 h-4 text-emerald-400" />
           </div>
-          <div className="mt-2 flex items-baseline space-x-2">
-            <span className="text-2xl font-bold tracking-tight text-white">
-              ${equity.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-            </span>
-            <span className="text-xs text-slate-400">USDT</span>
-          </div>
-          <div className="mt-2 flex items-center justify-between text-xs">
-            <span className="text-slate-400">Capital Active:</span>
-            <span className="text-slate-300 font-semibold">
-              {(config.balanceUsagePercent * 100).toFixed(0)}% (${(equity * config.balanceUsagePercent).toFixed(1)})
-            </span>
-          </div>
+          {showServerEquity ? (
+            <div className="mt-2">
+              <span className="text-2xl font-bold tracking-tight text-slate-500">—</span>
+              <p className="mt-2 text-[11px] text-slate-500 leading-snug">
+                No risk state in trading.db yet. Equity appears after the engine persists its first risk snapshot.
+              </p>
+            </div>
+          ) : (
+            <>
+              <div className="mt-2 flex items-baseline space-x-2">
+                <span className="text-2xl font-bold tracking-tight text-white">
+                  ${equity.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </span>
+                <span className="text-xs text-slate-400">USDT</span>
+              </div>
+              <div className="mt-2 flex items-center justify-between text-xs">
+                <span className="text-slate-400">Capital Active:</span>
+                <span className="text-slate-300 font-semibold">
+                  {(config.balanceUsagePercent * 100).toFixed(0)}% (${(equity * config.balanceUsagePercent).toFixed(1)})
+                </span>
+              </div>
+            </>
+          )}
         </div>
 
         {/* Daily PnL & Floating */}
@@ -548,6 +595,9 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
         <VpsSyncModal
           config={config}
           onClose={() => setShowVpsSync(false)}
+          vpsConnected={vpsConnected}
+          onApplyToVps={onPushConfigToVps}
+          lastPushResult={vpsPushResult}
         />
       )}
     </div>

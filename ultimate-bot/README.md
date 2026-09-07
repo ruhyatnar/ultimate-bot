@@ -151,6 +151,22 @@ npx serve -s dist -l 3000
 ```
 When running via `npx serve`, the frontend automatically polls `http://localhost:3000/api/status` or allows you to enter your remote VPS IP in the **VPS Connection Bar**!
 
+### Interactive Control API (Tune & Operate from the Web)
+
+`status.py --web` is not read-only — the web dashboard can operate the live engine:
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/status` | GET | Full snapshot: process state, SQLite trades/orders/risk, tunable config, engine pause state |
+| `/api/logs?lines=120` | GET | Tail the real `logs/trading.log` so the web Debug Console mirrors the engine |
+| `/api/control` | POST | `{"action": "pause" \| "resume" \| "close_all" \| "close_symbol", "symbol": "..."}` |
+| `/api/config` | POST | `{"env_file": "<generated .env content>"}` — merges whitelisted tunable keys into `.env` and reloads via `pm2 reload ultimate-bot` |
+
+How it works:
+- The engine watches `data/engine_control.json` (configurable via `CONTROL_FILE`). `pause` blocks **new entries** while open positions keep being managed (stops/TP/trailing stay armed); `close_all` / `close_symbol` execute once via a deduplicated `command_id`.
+- `/api/config` only accepts a **whitelist** of tuning keys — credentials (`BINANCE_API_KEY`, private key path, `DISCORD_WEBHOOK_URL`) are never writable from the browser, and the merge preserves all other lines.
+- The dashboard exposes these as **Pause Engine / Resume**, **Close All**, **Push to VPS**, and the live log stream — no SSH needed for routine tuning.
+
 ### Remote Browser Access:
 1. Open port 3000 in your **Tencent Cloud VPS Security Group** (Inbound rule: Protocol TCP, Port 3000, Source 0.0.0.0/0).
 2. Visit `http://YOUR_VPS_IP:3000` in your web browser.

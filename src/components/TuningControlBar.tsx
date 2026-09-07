@@ -1,20 +1,18 @@
 import React, { useState } from 'react';
 import { 
   Sliders, 
-  Zap, 
-  ShieldAlert, 
   Activity, 
   Clock, 
   Percent, 
   Flame, 
-  Terminal, 
   ChevronDown, 
   ChevronUp, 
-  Radio, 
   Globe, 
   AlertOctagon,
   Sparkles,
-  Share2
+  Share2,
+  PauseCircle,
+  PlayCircle
 } from 'lucide-react';
 import { BotConfig, StrategyPreset } from '../types';
 
@@ -29,6 +27,9 @@ interface TuningControlBarProps {
   onToggleLiveBinanceFeed: () => void;
   activeSymbols: string[];
   activeTradesCount: number;
+  vpsConnected?: boolean;
+  controlPaused?: boolean;
+  onToggleVpsPause?: () => void;
 }
 
 export const TuningControlBar: React.FC<TuningControlBarProps> = ({
@@ -41,7 +42,10 @@ export const TuningControlBar: React.FC<TuningControlBarProps> = ({
   useLiveBinanceFeed,
   onToggleLiveBinanceFeed,
   activeSymbols,
-  activeTradesCount
+  activeTradesCount,
+  vpsConnected = false,
+  controlPaused = false,
+  onToggleVpsPause
 }) => {
   const [isExpanded, setIsExpanded] = useState<boolean>(false);
   const [selectedBoostSymbol, setSelectedBoostSymbol] = useState<string>(activeSymbols[0] || 'BTCUSDT');
@@ -132,6 +136,23 @@ export const TuningControlBar: React.FC<TuningControlBarProps> = ({
 
         {/* Right: Quick Actions & Expand */}
         <div className="flex items-center space-x-2 ml-auto">
+          {/* Remote Engine Pause / Resume (VPS mode only) */}
+          {vpsConnected && onToggleVpsPause && (
+            <button
+              id="vps-pause-toggle-btn"
+              onClick={onToggleVpsPause}
+              className={`flex items-center space-x-1 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all shadow-sm ${
+                controlPaused
+                  ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 hover:bg-amber-500 hover:text-white'
+                  : 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700 hover:text-white'
+              }`}
+              title={controlPaused ? 'Resume the live engine (entries re-enabled)' : 'Pause new entries on the live engine (open positions stay managed)'}
+            >
+              {controlPaused ? <PlayCircle className="w-3.5 h-3.5" /> : <PauseCircle className="w-3.5 h-3.5" />}
+              <span>{controlPaused ? 'Engine Paused — Resume' : 'Pause Engine'}</span>
+            </button>
+          )}
+
           {/* VPS Sync Button */}
           <button
             id="open-vps-sync-btn"

@@ -3,12 +3,7 @@ import {
   Terminal as TerminalIcon, 
   Trash2, 
   Copy, 
-  Check, 
-  Filter, 
-  ArrowDown, 
-  Shield, 
-  Clock, 
-  AlertCircle 
+  Check 
 } from 'lucide-react';
 import { LogMessage } from '../types';
 
@@ -116,6 +111,16 @@ export const DebugConsole: React.FC<DebugConsoleProps> = ({
             }`}
           >
             Risk & Cooldown
+          </button>
+          <button
+            onClick={() => setFilter('DEBUG')}
+            className={`px-2.5 py-1 rounded-md font-medium transition-colors ${
+              filter === 'DEBUG'
+                ? 'bg-sky-500/20 text-sky-300 border border-sky-500/40'
+                : 'bg-slate-900/60 text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            DEBUG Lines Only
           </button>
 
           <div className="h-4 w-px bg-slate-700 mx-1 hidden sm:block" />

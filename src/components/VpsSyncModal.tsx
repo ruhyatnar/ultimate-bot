@@ -6,82 +6,42 @@ import {
   Terminal, 
   Server, 
   FileText, 
-  RefreshCw, 
-  AlertCircle,
   Sparkles,
-  ArrowRight
+  Send,
+  Loader2,
+  AlertTriangle,
+  CheckCircle2
 } from 'lucide-react';
-import { BotConfig } from '../types';
+import { BotConfig, PushResult } from '../types';
+import { generateEnvString } from '../utils/envGenerator';
 
 interface VpsSyncModalProps {
   config: BotConfig;
   onClose: () => void;
+  vpsConnected?: boolean;
+  onApplyToVps?: () => Promise<PushResult>;
+  lastPushResult?: PushResult | null;
 }
 
-export const VpsSyncModal: React.FC<VpsSyncModalProps> = ({ config, onClose }) => {
+export const VpsSyncModal: React.FC<VpsSyncModalProps> = ({ config, onClose, vpsConnected = false, onApplyToVps, lastPushResult = null }) => {
   const [copiedScript, setCopiedScript] = useState<boolean>(false);
   const [copiedEnv, setCopiedEnv] = useState<boolean>(false);
+  const [isApplying, setIsApplying] = useState<boolean>(false);
+  const [applyResult, setApplyResult] = useState<PushResult | null>(lastPushResult);
 
-  const generateEnvContent = () => {
-    return `# =================================================================
-# BINANCE ULTIMATE BOT — TUNED CONFIGURATION
-# Generated via Interactive Web Monitor
-# =================================================================
-
-# --- Trading Mode ---
-PAPER_TRADE=${config.paperTrade}
-USE_TESTNET=${config.useTestnet}
-
-# --- Binance Credentials ---
-BINANCE_API_KEY=your_binance_api_key_here
-BINANCE_PRIVATE_KEY_PATH=./keys/private_key.pem
-
-# --- Preset Strategy Profile ---
-PRESET=${config.preset}
-
-# --- Technical Parameters ---
-TIMEFRAME=${config.timeframe}
-MTF_TIMEFRAME=${config.mtfTimeframe}
-ATR_PERIOD=${config.atrPeriod}
-ATR_MULTIPLIER_SL=${config.atrMultiplierSl}
-ATR_MULTIPLIER_TP=${config.atrMultiplierTp}
-TRAILING_STOP_ACTIVATE=${config.trailingStopActivate}
-TRAILING_STOP_CALLBACK=${config.trailingStopCallback}
-SWING_LOOKBACK=${config.swingLookback}
-MAX_HOLD_TIME=${config.maxHoldTime}
-
-# --- Confluence & Signal Engine ---
-SIGNAL_THRESHOLD=${config.signalThreshold}
-SIGNAL_INTERVAL=${config.signalInterval}
-
-# --- Risk & Portfolio Limits ---
-BALANCE_USAGE_PERCENT=${config.balanceUsagePercent}
-MAX_SYMBOL_ALLOCATION_PERCENT=${config.maxSymbolAllocationPercent}
-MAX_DAILY_DRAWDOWN=${config.maxDailyDrawdown}
-MAX_LOSS_STREAK=${config.maxLossStreak}
-MAX_WIN_STREAK=${config.maxWinStreak}
-COOLDOWN_LOSS=${config.cooldownLoss}
-COOLDOWN_WIN=${config.cooldownWin}
-
-# --- Symbols Configuration ---
-DYNAMIC_SYMBOLS=${config.dynamicSymbols}
-MAX_SYMBOLS=${config.maxSymbols}
-STATIC_SYMBOLS=${config.staticSymbols.join(',')}
-QUOTE_ASSET=USDT
-EXCLUDE_SYMBOLS=USDC,BUSD,UP,DOWN,FDUSD,TUSD,DAI
-
-# --- Dynamic Screener & ADX ---
-ADX_THRESHOLD=${config.adxThreshold}
-ADX_PERIOD=${config.adxPeriod}
-TOP_CANDIDATES=50
-MIN_VOLUME_USDT=1000000
-
-# --- Database & Webhooks ---
-DB_PATH=./data/trading.db
-DISCORD_WEBHOOK_URL=${config.discordWebhookUrl}
-LOG_LEVEL=${config.logLevel}
-`;
+  const handleApplyToVps = async () => {
+    if (!onApplyToVps) return;
+    setIsApplying(true);
+    setApplyResult(null);
+    try {
+      const result = await onApplyToVps();
+      setApplyResult(result);
+    } finally {
+      setIsApplying(false);
+    }
   };
+
+  const generateEnvContent = () => generateEnvString(config);
 
   const bashCommand = `cat << 'EOF' > .env
 ${generateEnvContent()}EOF
@@ -129,6 +89,47 @@ pm2 reload ultimate-bot
 
         {/* Content */}
         <div className="p-5 space-y-4 overflow-y-auto flex-1 text-xs">
+          {/* One-Click Live Apply (when connected to the VPS web monitor) */}
+          {vpsConnected && onApplyToVps && (
+            <div className="bg-emerald-950/40 border border-emerald-700/50 rounded-xl p-4">
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                <div className="flex items-start space-x-2.5">
+                  <Send className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                  <div>
+                    <div className="font-bold text-emerald-200">Push to Running Bot</div>
+                    <p className="text-emerald-300/80 mt-0.5">
+                      Applies these tuned parameters directly to the VPS <code className="text-emerald-300">.env</code> and reloads the engine via PM2 — no SSH needed.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  id="apply-config-to-vps-btn"
+                  onClick={handleApplyToVps}
+                  disabled={isApplying}
+                  className="px-4 py-2 rounded-lg font-bold text-xs bg-emerald-600 hover:bg-emerald-500 text-white transition-colors disabled:opacity-60 flex items-center justify-center space-x-1.5 shadow-sm shrink-0"
+                >
+                  {isApplying ? (
+                    <><Loader2 className="w-3.5 h-3.5 animate-spin" /><span>Applying...</span></>
+                  ) : (
+                    <><Send className="w-3.5 h-3.5" /><span>Apply to Live Bot</span></>
+                  )}
+                </button>
+              </div>
+              {applyResult && (
+                <div className={`mt-3 p-3 rounded-lg border text-[11px] flex items-start space-x-2 ${
+                  applyResult.ok
+                    ? 'bg-emerald-900/40 border-emerald-700 text-emerald-200'
+                    : 'bg-rose-950/60 border-rose-700 text-rose-200'
+                }`}>
+                  {applyResult.ok
+                    ? <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                    : <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />}
+                  <span>{applyResult.message}</span>
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Workflow Step Explanation */}
           <div className="bg-slate-800/60 p-4 rounded-xl border border-slate-700/60">
             <div className="font-semibold text-slate-200 mb-2 flex items-center space-x-1.5">

@@ -43,7 +43,8 @@ class TrendDetector:
                 price_change = abs(float(t["priceChangePercent"]))
                 high = float(t["highPrice"]); low = float(t["lowPrice"]); last = float(t["lastPrice"])
                 volatility = (high - low) / last * 100 if last > 0 else 0
-            except: continue
+            except (ValueError, TypeError, KeyError):
+                continue
             if volume < self.config["MIN_VOLUME_USDT"] or price_change < self.config["MIN_PRICE_CHANGE_PERCENT"] or volatility < self.config["MIN_VOLATILITY_PERCENT"]:
                 continue
             candidates.append({"symbol": symbol, "volume": volume, "price_change": price_change, "volatility": volatility})
@@ -152,5 +153,7 @@ class TrendDetector:
                         else:
                             for d in data:
                                 if d["symbol"] == s2: d["final_score"] *= self.config["CORRELATION_PENALTY"]
-                except: continue
+                except (StopIteration, ValueError, TypeError):
+                    # Missing/invalid data for this pair — skip correlation check
+                    continue
         return data
