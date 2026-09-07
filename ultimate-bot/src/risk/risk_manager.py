@@ -125,16 +125,17 @@ class RiskManager:
         allocation = min(allocation, max_symbol_alloc)
 
         # Safeguard: Never allocate more than available free quote currency (e.g. USDT)
+        free_quote = None
         if not self.config.get("PAPER_TRADE", False):
             try:
                 account = await self.rest.get_account()
-                free_quote = 0.0
                 for b in account.get("balances", []):
                     if b["asset"] == self.config["QUOTE_ASSET"]:
                         free_quote = float(b["free"])
                         break
-                max_spendable = Decimal(str(max(0.0, free_quote * 0.99)))
-                allocation = min(allocation, max_spendable)
+                if free_quote is not None:
+                    max_spendable = Decimal(str(max(0.0, free_quote * 0.99)))
+                    allocation = min(allocation, max_spendable)
             except Exception as e:
                 self.logger.warning(f"Failed to check free quote asset balance: {e}")
 
@@ -147,9 +148,15 @@ class RiskManager:
         notional_filter = filters.get("NOTIONAL", filters.get("MIN_NOTIONAL", {}))
         min_notional = float(notional_filter.get("minNotional", 5.0))
         if float(allocation) < min_notional:
+            needed = min_notional * 1.02
+            if free_quote is not None and free_quote < needed:
+                self.logger.warning(
+                    f"Free quote balance ({free_quote:.2f} {self.config.get('QUOTE_ASSET', 'USDT')}) is below minNotional ({needed:.2f}) for {symbol}. Order skipped."
+                )
+                return 0.0
             if float(self.total_equity) >= min_notional:
                 self.logger.info(f"Allocation {float(allocation):.2f} USDT is below minNotional {min_notional} for {symbol}. Bumping allocation to minNotional.")
-                qty_dec = Decimal(str(min_notional * 1.02)) / Decimal(str(entry_price))
+                qty_dec = Decimal(str(needed)) / Decimal(str(entry_price))
             else:
                 self.logger.warning(f"Total equity {self.total_equity} is less than minNotional {min_notional} for {symbol}.")
                 return 0.0
@@ -158,7 +165,15 @@ class RiskManager:
         qty_dec = max(qty_dec, min_qty)
         if "maxQty" in filters.get("LOT_SIZE", {}):
             qty_dec = min(qty_dec, Decimal(str(filters["LOT_SIZE"]["maxQty"])))
-        if float(qty_dec) * entry_price > float(self.total_equity):
-            self.logger.warning(f"Calculated size {float(qty_dec)} ({float(qty_dec)*entry_price:.2f} USDT) exceeds total equity ({self.total_equity:.2f} USDT) for {symbol}. Skipped.")
+
+        order_cost = float(qty_dec) * entry_price
+        if free_quote is not None and order_cost > free_quote:
+            self.logger.warning(
+                f"Calculated cost {order_cost:.2f} USDT exceeds available free quote ({free_quote:.2f} USDT) for {symbol}. Skipped."
+            )
+            return 0.0
+
+        if order_cost > float(self.total_equity):
+            self.logger.warning(f"Calculated size {float(qty_dec)} ({order_cost:.2f} USDT) exceeds total equity ({self.total_equity:.2f} USDT) for {symbol}. Skipped.")
             return 0.0
         return float(qty_dec)

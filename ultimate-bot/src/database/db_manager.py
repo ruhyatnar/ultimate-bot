@@ -62,6 +62,12 @@ class DatabaseManager:
             return await cursor.fetchone()
 
     async def close(self):
+        # Allow writer worker to drain any queued writes before shutting down
+        try:
+            if not self.write_queue.empty():
+                await asyncio.wait_for(self.write_queue.join(), timeout=3.0)
+        except Exception:
+            pass
         if self._writer_task:
             self._writer_task.cancel()
             try:

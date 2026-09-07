@@ -94,7 +94,13 @@ def load_config():
         raise ValueError("SIGNAL_THRESHOLD must be between 1 and 5.")
     if config["SIGNAL_INTERVAL"] < 1:
         raise ValueError("SIGNAL_INTERVAL must be at least 1 second.")
-    if not config["PAPER_TRADE"] and not private_key_path.exists():
-        raise FileNotFoundError(f"Private key file not found: {private_key_path}")
+    if not config["PAPER_TRADE"]:
+        has_pem = private_key_path and private_key_path.exists()
+        has_secret = bool(config.get("API_SECRET"))
+        if not has_pem and not has_secret:
+            raise ValueError(
+                f"Live trading requires either BINANCE_API_SECRET (for standard HMAC-SHA256) "
+                f"or BINANCE_PRIVATE_KEY_PATH (for Ed25519; file not found at {private_key_path})."
+            )
 
     return config

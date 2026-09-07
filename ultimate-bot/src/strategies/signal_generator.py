@@ -63,9 +63,9 @@ class SignalGenerator:
         if fvg > 0: bullish += 1
         elif fvg < 0: bearish += 1
         if delta > 0: bullish += 1
-        else: bearish += 1
+        elif delta < 0: bearish += 1
         if ltf_df['close'].iloc[-1] > poc: bullish += 1
-        else: bearish += 1
+        elif ltf_df['close'].iloc[-1] < poc: bearish += 1
 
         threshold = self.config["SIGNAL_THRESHOLD"]
         self.logger.debug(f"{symbol}: htf={htf_trend}, bos={bos}, fvg={fvg}, delta={delta}, poc={poc}, bullish={bullish}, bearish={bearish}, threshold={threshold}")

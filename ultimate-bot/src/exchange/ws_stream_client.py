@@ -91,14 +91,15 @@ class WSStreamClient:
             self._subscribed_symbols.discard(s)
 
     async def disconnect(self):
-        if self._reconnect_task:
+        current_task = asyncio.current_task()
+        if self._reconnect_task and self._reconnect_task is not current_task:
             self._reconnect_task.cancel()
             try:
                 await self._reconnect_task
             except asyncio.CancelledError:
                 pass
             self._reconnect_task = None
-        if self._listen_task:
+        if self._listen_task and self._listen_task is not current_task:
             self._listen_task.cancel()
             try:
                 await self._listen_task
@@ -106,9 +107,13 @@ class WSStreamClient:
                 pass
             self._listen_task = None
         if self.websocket:
-            await self.websocket.close()
-            self.connected = False
-            self._subscribed_symbols.clear()
+            try:
+                await self.websocket.close()
+            except Exception:
+                pass
+            self.websocket = None
+        self.connected = False
+        self._subscribed_symbols.clear()
 
     def is_connected(self):
         if not self.connected or self.websocket is None:
@@ -134,15 +139,16 @@ class WSStreamClient:
                 msg = await self.websocket.recv()
                 data = json.loads(msg)
                 await self._process(data)
-            except websockets.exceptions.ConnectionClosed:
+            except (websockets.exceptions.ConnectionClosed, websockets.exceptions.WebSocketException, OSError, asyncio.TimeoutError) as e:
                 self.connected = False
-                self.logger.warning("WebSocket Stream connection closed. Reconnecting...")
+                self.logger.warning(f"WebSocket Stream disconnected ({e}). Reconnecting...")
                 # Reconnect on a fresh socket object. Calling self.connect() directly
                 # here would block the listener and, worse, self.connect() reassigns
                 # self.websocket while this coroutine still holds the dead one.
-                self._reconnect_task = asyncio.create_task(
-                    self._reconnect_loop(list(self._subscribed_symbols))
-                )
+                if not self._reconnect_task or self._reconnect_task.done():
+                    self._reconnect_task = asyncio.create_task(
+                        self._reconnect_loop(list(self._subscribed_symbols))
+                    )
                 break
             except asyncio.CancelledError:
                 break

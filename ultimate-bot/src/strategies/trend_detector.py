@@ -143,8 +143,14 @@ class TrendDetector:
                     closes1 = next(d["closes"] for d in data if d["symbol"]==s1)
                     closes2 = next(d["closes"] for d in data if d["symbol"]==s2)
                     min_len = min(len(closes1), len(closes2))
-                    corr, _ = pearsonr(closes1[-min_len:], closes2[-min_len:])
-                    if abs(corr) > self.config["CORRELATION_THRESHOLD"]:
+                    if min_len < 10:
+                        continue
+                    c1 = closes1[-min_len:]
+                    c2 = closes2[-min_len:]
+                    if np.std(c1) == 0 or np.std(c2) == 0:
+                        continue
+                    corr, _ = pearsonr(c1, c2)
+                    if not math.isnan(corr) and abs(corr) > self.config["CORRELATION_THRESHOLD"]:
                         score1 = next(d["final_score"] for d in data if d["symbol"]==s1)
                         score2 = next(d["final_score"] for d in data if d["symbol"]==s2)
                         if score1 < score2:

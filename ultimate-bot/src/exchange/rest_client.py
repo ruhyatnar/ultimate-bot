@@ -1,8 +1,11 @@
 import asyncio
 import time
 import base64
+import hashlib
+import hmac
 import json
 import logging
+from pathlib import Path
 from urllib.parse import urlencode
 import aiohttp
 from aiolimiter import AsyncLimiter
@@ -17,7 +20,8 @@ class RestClient:
     def __init__(self, config):
         self.config = config
         self.api_key = config["API_KEY"]
-        self.private_key_path = config["PRIVATE_KEY_PATH"]
+        self.api_secret = config.get("API_SECRET")
+        self.private_key_path = config.get("PRIVATE_KEY_PATH")
         self.use_testnet = config.get("USE_TESTNET", False)
         self.base_url = self.BASE_URL_TESTNET if self.use_testnet else self.BASE_URL
         self.logger = logging.getLogger(__name__)
@@ -33,11 +37,18 @@ class RestClient:
         self._initialized = False
         self._init_lock = asyncio.Lock()
         if not config.get("PAPER_TRADE", False):
-            with open(self.private_key_path, "rb") as f:
-                key = serialization.load_pem_private_key(f.read(), password=None)
-            if not isinstance(key, Ed25519PrivateKey):
-                raise ValueError("Private key is not Ed25519")
-            self._private_key = key
+            pem_path = Path(self.private_key_path) if self.private_key_path else None
+            if pem_path and pem_path.exists():
+                with open(pem_path, "rb") as f:
+                    key = serialization.load_pem_private_key(f.read(), password=None)
+                if not isinstance(key, Ed25519PrivateKey):
+                    raise ValueError("Private key is not Ed25519")
+                self._private_key = key
+                self.logger.info("RestClient configured with Ed25519 asymmetric signature.")
+            elif self.api_secret:
+                self.logger.info("RestClient configured with HMAC-SHA256 API secret.")
+            else:
+                raise ValueError("Live trading requires either Ed25519 private key or BINANCE_API_SECRET.")
 
     async def _ensure_session(self):
         if self.session is None:
@@ -102,9 +113,12 @@ class RestClient:
         if signed:
             params["timestamp"] = await self._get_timestamp()
             query_string = urlencode(sorted(params.items()))
-            if not self._private_key:
-                raise Exception("Private key not available for signing.")
-            params["signature"] = self._sign_ed25519(query_string)
+            if self._private_key:
+                params["signature"] = self._sign_ed25519(query_string)
+            elif self.api_secret:
+                params["signature"] = self._sign_hmac_sha256(query_string)
+            else:
+                raise Exception("Neither Ed25519 private key nor API secret available for signing.")
             headers["Content-Type"] = "application/x-www-form-urlencoded"
         async with self.limiter:
             async with self.session.request(method, url, params=params, headers=headers) as resp:
@@ -136,6 +150,9 @@ class RestClient:
 
     def _sign_ed25519(self, message: str) -> str:
         return base64.b64encode(self._private_key.sign(message.encode())).decode()
+
+    def _sign_hmac_sha256(self, message: str) -> str:
+        return hmac.new(self.api_secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
 
     async def ping(self):
         return await self._request("GET", "/api/v3/ping")

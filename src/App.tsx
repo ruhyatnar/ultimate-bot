@@ -470,6 +470,15 @@ export default function App() {
           const pnl = parseFloat(o.profit_loss || 0);
           const pnlPct = entryP > 0 && q > 0 ? (pnl / (entryP * q)) * 100 : 0;
 
+          const parseTs = (val: any, fallback: number): number => {
+            if (!val) return fallback;
+            if (typeof val === 'number') return val < 1e11 ? val * 1000 : val;
+            const num = Number(val);
+            if (!isNaN(num)) return num < 1e11 ? num * 1000 : num;
+            const d = new Date(val).getTime();
+            return isNaN(d) ? fallback : d;
+          };
+
           return {
             id: `order_${o.order_id}`,
             symbol: o.symbol,
@@ -479,8 +488,8 @@ export default function App() {
             quantity: q,
             pnl,
             pnlPct,
-            entryTime: o.created_at ? new Date(o.created_at).getTime() : Date.now() - 3600000,
-            exitTime: o.updated_at ? new Date(o.updated_at).getTime() : Date.now(),
+            entryTime: parseTs(o.created_at, Date.now() - 3600000),
+            exitTime: parseTs(o.updated_at, Date.now()),
             exitReason: (o.status || 'FILLED') as any
           };
         });

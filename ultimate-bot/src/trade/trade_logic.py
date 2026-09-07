@@ -177,7 +177,7 @@ class TradeLogic:
                 # Web-monitor pause: block NEW entries but keep managing open
                 # positions so stops/TPs/trailing stays armed while the operator
                 # reviews the market.
-                self.logger.info("Web-monitor pause ACTIVE — new entries blocked; managing open positions only.")
+                self.logger.debug("Web-monitor pause ACTIVE — new entries blocked; managing open positions only.")
                 for symbol in list(self.active_trades.keys()):
                     try:
                         await self.manage_trade(symbol)
@@ -439,19 +439,20 @@ class TradeLogic:
             return
 
         fill_price = None
-        if fill_override:
-            fill_price = fill_override
-        elif not self.config["PAPER_TRADE"]:
-            # Live mode: use the exchange's actual average fill price so slippage
-            # on market exits is captured in PnL (ticker-based PnL is inaccurate).
+        if not self.config["PAPER_TRADE"] and exit_order_id:
+            # Live mode: always query the exchange's actual average fill price so slippage
+            # and market impact are accurately recorded in PnL.
             try:
                 order_info = await self.rest.get_order(symbol, exit_order_id)
                 avg = float(order_info.get("avgPrice", 0) or 0)
                 if avg > 0:
                     fill_price = avg
             except Exception as e:
-                self.logger.warning(f"Could not fetch exit avg fill price: {e}")
-        else:
+                self.logger.warning(f"Could not fetch exit avg fill price for {symbol}: {e}")
+
+        if not fill_price and fill_override:
+            fill_price = fill_override
+        elif not fill_price and self.config["PAPER_TRADE"] and exit_order_id:
             row = await self.db.fetch_one("SELECT avg_fill_price FROM orders WHERE order_id = ?", (exit_order_id,))
             fill_price = float(row[0]) if row and row[0] else None
         if not fill_price:

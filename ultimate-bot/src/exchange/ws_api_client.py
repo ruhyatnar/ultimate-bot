@@ -66,11 +66,16 @@ class WSApiClient:
                 await asyncio.sleep(min(2 ** retry_count, 30))
 
     async def disconnect(self):
-        if self._monitor_task:
+        current_task = asyncio.current_task()
+        if self._monitor_task and self._monitor_task is not current_task:
             self._monitor_task.cancel()
             self._monitor_task = None
         if self.websocket:
-            await self.websocket.close()
+            try:
+                await self.websocket.close()
+            except Exception:
+                pass
+            self.websocket = None
             self.connected = False
         if self._session:
             await self._session.close()

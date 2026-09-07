@@ -57,6 +57,25 @@ interface LiveDashboardProps {
   onToggleVpsPause?: () => void;
 }
 
+const formatPrice = (val: number): string => {
+  if (val === 0 || isNaN(val)) return '$0.00';
+  const abs = Math.abs(val);
+  if (abs >= 1000) return `$${val.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  if (abs >= 1) return `$${val.toFixed(2)}`;
+  if (abs >= 0.01) return `$${val.toFixed(4)}`;
+  if (abs >= 0.0001) return `$${val.toFixed(6)}`;
+  return `$${val.toFixed(8)}`;
+};
+
+const formatQty = (val: number): string => {
+  if (val === 0 || isNaN(val)) return '0';
+  const abs = Math.abs(val);
+  if (abs >= 1000) return val.toLocaleString('en-US', { maximumFractionDigits: 2 });
+  if (abs >= 1) return val.toFixed(4).replace(/\.?0+$/, '');
+  if (abs >= 0.001) return val.toFixed(6).replace(/\.?0+$/, '');
+  return val.toFixed(8).replace(/\.?0+$/, '');
+};
+
 export const LiveDashboard: React.FC<LiveDashboardProps> = ({
   equity,
   dailyRealizedPnl,
@@ -450,22 +469,22 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
                       </td>
 
                       <td className="py-3.5 px-4 font-mono">
-                        <div className="text-slate-300">In: ${trade.entryPrice.toFixed(2)}</div>
-                        <div className="font-bold text-slate-100">Now: ${trade.currentPrice.toFixed(2)}</div>
+                        <div className="text-slate-300">In: {formatPrice(trade.entryPrice)}</div>
+                        <div className="font-bold text-slate-100">Now: {formatPrice(trade.currentPrice)}</div>
                       </td>
 
                       <td className="py-3.5 px-4 font-mono">
-                        <div className="text-slate-200 font-semibold">{trade.quantity.toFixed(4)}</div>
+                        <div className="text-slate-200 font-semibold">{formatQty(trade.quantity)}</div>
                         <div className="text-slate-400 text-[11px]">${trade.notional.toFixed(2)} USDT</div>
                       </td>
 
                       <td className="py-3.5 px-4 font-mono">
-                        <div className="text-rose-400 font-semibold">${trade.stopPrice.toFixed(2)}</div>
+                        <div className="text-rose-400 font-semibold">{formatPrice(trade.stopPrice)}</div>
                         <div className="text-[11px] text-slate-400">-{slDistance.toFixed(2)}% away</div>
                       </td>
 
                       <td className="py-3.5 px-4 font-mono">
-                        <div className="text-emerald-400 font-semibold">${trade.takeProfit.toFixed(2)}</div>
+                        <div className="text-emerald-400 font-semibold">{formatPrice(trade.takeProfit)}</div>
                         <div className="text-[11px] text-slate-400">+{tpDistance.toFixed(2)}% away</div>
                       </td>
 
@@ -553,7 +572,7 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
                       </span>
                     </td>
                     <td className="py-2.5 px-4 font-mono text-slate-300">
-                      ${trade.entryPrice.toFixed(2)} → ${trade.exitPrice.toFixed(2)}
+                      {formatPrice(trade.entryPrice)} → {formatPrice(trade.exitPrice)}
                     </td>
                     <td className="py-2.5 px-4">
                       <span className={`px-2 py-0.5 text-[10px] font-semibold rounded ${
