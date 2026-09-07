@@ -161,6 +161,15 @@ class TradeLogic:
                 if add_syms: await self.ws_stream.subscribe(add_syms)
                 if remove_syms: await self.ws_stream.unsubscribe(remove_syms)
 
+        # Persist monitored symbols and scanned pairs to SQLite for status.py and web monitor
+        try:
+            await self.db.set_risk_state("monitored_symbols", json.dumps(self.current_symbols))
+            scanned = self.trend_detector.get_last_scanned()
+            if scanned:
+                await self.db.set_risk_state("scanned_pairs", json.dumps(scanned))
+        except Exception as e:
+            self.logger.debug(f"Could not persist scanned pairs to db: {e}")
+
     async def refresh_symbols_loop(self):
         while True:
             await asyncio.sleep(self.config["SYMBOL_REFRESH_INTERVAL"])
@@ -192,8 +201,10 @@ class TradeLogic:
                 continue
             if not self.config["PAPER_TRADE"]:
                 now = time.time()
-                if now - self.last_exchange_sync_time >= 300:
+                if now - self.last_exchange_sync_time >= 60:
                     await self.sync_positions_from_exchange()
+                    await self.risk_mgr._fetch_equity()
+                    await self.risk_mgr.save_state()
                     self.last_exchange_sync_time = now
             if not self.current_symbols:
                 await self.update_symbols()
@@ -529,6 +540,12 @@ class TradeLogic:
 
         await self.db.delete_active_trade(symbol)
         await self.risk_mgr.update_trade_result(pnl, symbol)
+        if not self.config["PAPER_TRADE"]:
+            try:
+                await self.risk_mgr._fetch_equity()
+                await self.risk_mgr.save_state()
+            except Exception as e:
+                self.logger.warning(f"Could not refresh equity after exit: {e}")
         emoji = "✅" if pnl >= 0 else "❌"
         await self.webhook.send(f"{emoji} CLOSE {symbol} ({reason}) Net PnL: {pnl:+.2f} USDT (Gross: {gross_pnl:+.2f}, Fees: -{total_fees:.2f})")
         self.logger.info(f"Closed {symbol} due to {reason}, Net PnL: {pnl:.2f} (Gross: {gross_pnl:.2f}, Fees: -{total_fees:.2f})")

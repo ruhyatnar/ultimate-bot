@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-CLI Real-Time Monitor for Ultimate Binance Trading Bot
-Provides an htop/terminal-style live dashboard for headless Debian 13 VPS environments.
+CLI & Web Real-Time Monitor for Ultimate Binance Trading Bot
+Provides an htop/terminal-style live dashboard and comprehensive HTTP API for headless Debian 13 VPS environments.
 
 Usage:
   python3 status.py          # Single status snapshot
-  python3 status.py --watch  # Continuous live-refresh monitor (every 2s)
+  python3 status.py --watch  # Continuous live-refresh terminal monitor (every 2s)
+  python3 status.py --web    # Launch HTTP monitoring server on port 3000 (serves React dist or standalone HTML)
 """
 
 import os
@@ -18,11 +19,15 @@ import sqlite3
 import argparse
 import shutil
 import subprocess
+import urllib.request
+import urllib.parse
+import hmac
+import hashlib
 from datetime import datetime
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-# ANSI Color Codes for Debian CLI
+# ANSI Color Codes for Terminal Display
 GREEN = "\033[92m"
 RED = "\033[91m"
 YELLOW = "\033[93m"
@@ -32,6 +37,12 @@ BOLD = "\033[1m"
 DIM = "\033[2m"
 RESET = "\033[0m"
 CLEAR = "\033[2J\033[H"
+
+# In-memory TTL caches to prevent excessive I/O and respect exchange rate limits
+_balance_cache = {"ts": 0, "data": None}
+_scanned_cache = {"ts": 0, "data": None}
+_tickers_cache = {"ts": 0, "data": {}}
+
 
 def load_env(env_path=".env"):
     config = {}
@@ -44,9 +55,7 @@ def load_env(env_path=".env"):
                     config[k.strip()] = v.strip()
     return config
 
-# Keys the interactive web monitor is allowed to write into .env.
-# Secrets (API key, private key path, webhook URL) are intentionally excluded
-# so a browser-facing endpoint can never overwrite credentials.
+
 TUNING_KEYS = {
     "PAPER_TRADE", "USE_TESTNET", "PRESET", "TIMEFRAME", "MTF_TIMEFRAME",
     "ATR_PERIOD", "ATR_MULTIPLIER_SL", "ATR_MULTIPLIER_TP",
@@ -68,7 +77,6 @@ TUNING_KEYS = {
 
 
 def read_control(control_path):
-    """Read the engine control file (pause/close commands) written by the web monitor."""
     try:
         with open(control_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -78,7 +86,6 @@ def read_control(control_path):
 
 
 def write_control(control_path, data):
-    """Atomically persist engine control state."""
     os.makedirs(os.path.dirname(control_path) or ".", exist_ok=True)
     tmp = control_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -87,7 +94,6 @@ def write_control(control_path, data):
 
 
 def parse_env_payload(payload):
-    """Parse generated .env file content into a whitelist-filtered {KEY: value} map."""
     updates = {}
     for line in payload.splitlines():
         line = line.strip()
@@ -101,9 +107,23 @@ def parse_env_payload(payload):
 
 
 def apply_env_updates(env_path, updates):
-    """Merge whitelisted KEY=VALUE updates into .env atomically.
-    Preserves comments and unrelated lines; returns the applied keys."""
     applied = []
+    if not os.path.exists(env_path):
+        alt = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.path.basename(env_path))
+        if os.path.exists(alt):
+            env_path = alt
+        else:
+            example = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env.example")
+            if not os.path.exists(example) and os.path.exists(".env.example"):
+                example = ".env.example"
+            if os.path.exists(example):
+                try:
+                    with open(example, "r", encoding="utf-8") as ef:
+                        example_content = ef.read()
+                    with open(env_path, "w", encoding="utf-8") as target_f:
+                        target_f.write(example_content)
+                except Exception:
+                    pass
     if not os.path.exists(env_path):
         return applied
     with open(env_path, "r", encoding="utf-8") as f:
@@ -134,7 +154,6 @@ def apply_env_updates(env_path, updates):
 
 
 def tail_log_file(log_path, lines=120):
-    """Return the last `lines` lines of the engine log file."""
     try:
         with open(log_path, "r", encoding="utf-8", errors="replace") as f:
             return f.readlines()[-lines:]
@@ -158,9 +177,10 @@ def get_process_status():
     except Exception:
         return f"{YELLOW}● UNKNOWN{RESET}"
 
+
 def read_database(db_path):
     if not os.path.exists(db_path):
-        return {"error": f"Database not found at {db_path}", "trades": [], "orders": [], "risk": {}, "stats": {}}
+        return {"error": f"Database not found at {db_path}", "trades": [], "orders": [], "risk": {}, "stats": {}, "scanned_pairs": []}
 
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10.0)
@@ -169,7 +189,24 @@ def read_database(db_path):
 
         # Risk state
         risk_rows = cur.execute("SELECT key, value FROM risk_state").fetchall()
-        risk = {row["key"]: row["value"] for row in risk_rows}
+        risk = {}
+        for row in risk_rows:
+            risk[row["key"]] = row["value"]
+
+        # Parse JSON fields stored in risk_state if present
+        scanned_pairs = []
+        if "scanned_pairs" in risk:
+            try:
+                scanned_pairs = json.loads(risk["scanned_pairs"])
+            except Exception:
+                scanned_pairs = []
+
+        account_balances = []
+        if "account_balances" in risk:
+            try:
+                account_balances = json.loads(risk["account_balances"])
+            except Exception:
+                account_balances = []
 
         # Active trades
         trades_rows = cur.execute("SELECT * FROM active_trades").fetchall()
@@ -203,9 +240,266 @@ def read_database(db_path):
         }
 
         conn.close()
-        return {"risk": risk, "trades": trades, "orders": orders, "stats": stats}
+        return {
+            "risk": risk,
+            "trades": trades,
+            "orders": orders,
+            "stats": stats,
+            "scanned_pairs": scanned_pairs,
+            "balances": account_balances
+        }
     except Exception as e:
-        return {"error": str(e), "trades": [], "orders": [], "risk": {}, "stats": {}}
+        return {"error": str(e), "trades": [], "orders": [], "risk": {}, "stats": {}, "scanned_pairs": [], "balances": []}
+
+
+def fetch_binance_balance(env_config, db_data):
+    """
+    Unified balance provider:
+    - If PAPER_TRADE=true: returns simulated paper balance from database.
+    - If PAPER_TRADE=false: queries live Binance Spot API using HMAC or Ed25519 signing.
+      Falls back cleanly to database risk_state if offline or rate-limited.
+    """
+    global _balance_cache
+    now = time.time()
+    quote = env_config.get("QUOTE_ASSET", "USDT").strip().upper()
+    paper_mode = env_config.get("PAPER_TRADE", "true").lower() == "true"
+    risk = db_data.get("risk", {})
+
+    if paper_mode:
+        simulated_eq = float(risk.get("paper_balance") or risk.get("total_equity") or 1000.0)
+        daily_pnl = float(risk.get("daily_pnl") or 0.0)
+        return {
+            "is_live": False,
+            "quote_asset": quote,
+            "total_equity": simulated_eq,
+            "free_quote": simulated_eq,
+            "locked_quote": 0.0,
+            "daily_pnl": daily_pnl,
+            "balances": [
+                {"asset": quote, "free": simulated_eq, "locked": 0.0, "total": simulated_eq, "usd_value": simulated_eq}
+            ]
+        }
+
+    # Live Mode: Check TTL cache (5 seconds)
+    if _balance_cache["data"] and (now - _balance_cache["ts"] < 5.0):
+        return _balance_cache["data"]
+
+    # Try live query to Binance if API Key is configured
+    api_key = env_config.get("BINANCE_API_KEY", "").strip()
+    api_secret = env_config.get("BINANCE_API_SECRET", "").strip()
+    private_key_path = env_config.get("BINANCE_PRIVATE_KEY_PATH", "").strip()
+    use_testnet = env_config.get("USE_TESTNET", "false").lower() == "true"
+    base_url = "https://testnet.binance.vision" if use_testnet else "https://api.binance.com"
+
+    live_res = None
+    if api_key and (api_secret or (private_key_path and os.path.exists(private_key_path))):
+        try:
+            ts = int(time.time() * 1000)
+            query = f"timestamp={ts}"
+            signature = ""
+
+            if api_secret:
+                signature = hmac.new(api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+            elif private_key_path and os.path.exists(private_key_path):
+                try:
+                    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+                    from cryptography.hazmat.primitives import serialization
+                    import base64
+                    with open(private_key_path, "rb") as f:
+                        key_bytes = f.read()
+                    try:
+                        priv_key = serialization.load_pem_private_key(key_bytes, password=None)
+                    except Exception:
+                        priv_key = Ed25519PrivateKey.from_private_bytes(key_bytes.strip())
+                    signature = base64.b64encode(priv_key.sign(query.encode("utf-8"))).decode("utf-8")
+                except Exception:
+                    pass
+
+            if signature:
+                url = f"{base_url}/api/v3/account?{query}&signature={signature}"
+                req = urllib.request.Request(url, headers={"X-MBX-APIKEY": api_key, "User-Agent": "BinanceMonitor/2.0"})
+                with urllib.request.urlopen(req, timeout=4.0) as resp:
+                    if resp.status == 200:
+                        account = json.loads(resp.read().decode("utf-8"))
+                        total_equity = 0.0
+                        free_quote = 0.0
+                        locked_quote = 0.0
+                        balances = []
+
+                        for b in account.get("balances", []):
+                            asset = b.get("asset", "")
+                            free = float(b.get("free", 0.0))
+                            locked = float(b.get("locked", 0.0))
+                            tot = free + locked
+                            if tot <= 0.00000001:
+                                continue
+
+                            usd_val = 0.0
+                            if asset == quote:
+                                total_equity += tot
+                                free_quote = free
+                                locked_quote = locked
+                                usd_val = tot
+                            else:
+                                # Look up in fast tickers cache if available
+                                symbol = asset + quote
+                                ticker_p = _tickers_cache.get("data", {}).get(symbol, 0.0)
+                                usd_val = tot * ticker_p if ticker_p > 0 else 0.0
+                                total_equity += usd_val
+
+                            balances.append({
+                                "asset": asset,
+                                "free": free,
+                                "locked": locked,
+                                "total": tot,
+                                "usd_value": usd_val
+                            })
+
+                        # Sort balances: quote first, then descending by usd_value
+                        balances.sort(key=lambda x: (x["asset"] != quote, -x.get("usd_value", 0)))
+                        daily_pnl = float(risk.get("daily_pnl") or 0.0)
+
+                        live_res = {
+                            "is_live": True,
+                            "quote_asset": quote,
+                            "total_equity": round(total_equity, 2),
+                            "free_quote": round(free_quote, 2),
+                            "locked_quote": round(locked_quote, 2),
+                            "daily_pnl": daily_pnl,
+                            "balances": balances
+                        }
+        except Exception:
+            live_res = None
+
+    if live_res:
+        _balance_cache["ts"] = now
+        _balance_cache["data"] = live_res
+        return live_res
+
+    # Fallback to database risk_state
+    db_total = float(risk.get("total_equity") or risk.get("live_equity") or risk.get("equity") or risk.get("paper_balance") or 0.0)
+    db_free = float(risk.get("free_quote") or db_total)
+    db_locked = float(risk.get("locked_quote") or 0.0)
+    db_balances = db_data.get("balances") or []
+    if not db_balances and db_total > 0:
+        db_balances = [{"asset": quote, "free": db_free, "locked": db_locked, "total": db_total, "usd_value": db_total}]
+
+    fallback = {
+        "is_live": True,
+        "quote_asset": quote,
+        "total_equity": round(db_total, 2),
+        "free_quote": round(db_free, 2),
+        "locked_quote": round(db_locked, 2),
+        "daily_pnl": float(risk.get("daily_pnl") or 0.0),
+        "balances": db_balances
+    }
+    _balance_cache["ts"] = now
+    _balance_cache["data"] = fallback
+    return fallback
+
+
+def fetch_scanned_pairs(env_config, db_data):
+    """
+    Fetch market screener data:
+    1. Check SQLite risk_state for real engine-scanned pairs.
+    2. If empty, query Binance public 24h ticker API to populate top gainers/active pairs.
+    """
+    global _scanned_cache, _tickers_cache
+    now = time.time()
+
+    # If engine recently persisted scanned pairs in SQLite, return them
+    db_scanned = db_data.get("scanned_pairs")
+    if isinstance(db_scanned, list) and len(db_scanned) > 0:
+        _scanned_cache["ts"] = now
+        _scanned_cache["data"] = db_scanned
+        return db_scanned
+
+    # Check cache (15s TTL)
+    if _scanned_cache["data"] and (now - _scanned_cache["ts"] < 15.0):
+        return _scanned_cache["data"]
+
+    quote = env_config.get("QUOTE_ASSET", "USDT").strip().upper()
+    static_symbols = [s.strip().upper() for s in env_config.get("STATIC_SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip()]
+    max_symbols = int(env_config.get("MAX_SYMBOLS", "5"))
+
+    try:
+        url = "https://api.binance.com/api/v3/ticker/24hr"
+        req = urllib.request.Request(url, headers={"User-Agent": "BinanceScreener/2.0"})
+        with urllib.request.urlopen(req, timeout=4.0) as resp:
+            if resp.status == 200:
+                raw_tickers = json.loads(resp.read().decode("utf-8"))
+                price_map = {}
+                filtered = []
+                for t in raw_tickers:
+                    sym = t.get("symbol", "")
+                    if not sym.endswith(quote):
+                        continue
+                    if any(x in sym for x in ["UP", "DOWN", "BEAR", "BULL"]):
+                        continue
+                    try:
+                        last_p = float(t.get("lastPrice", 0.0))
+                        vol = float(t.get("quoteVolume", 0.0))
+                        chg = float(t.get("priceChangePercent", 0.0))
+                        high_p = float(t.get("highPrice", 0.0))
+                        low_p = float(t.get("lowPrice", 0.0))
+                        vola = round((high_p - low_p) / last_p * 100, 2) if last_p > 0 else 0.0
+                    except (ValueError, TypeError):
+                        continue
+
+                    price_map[sym] = last_p
+                    if vol >= 5000000 and abs(chg) >= 0.5:
+                        filtered.append({
+                            "symbol": sym,
+                            "price": last_p,
+                            "price_change_24h": round(chg, 2),
+                            "volume_24h": round(vol, 0),
+                            "volatility": vola,
+                            "high24h": high_p,
+                            "low24h": low_p
+                        })
+
+                # Update global tickers cache
+                _tickers_cache["ts"] = now
+                _tickers_cache["data"] = price_map
+
+                # Sort by 24h volume descending
+                filtered.sort(key=lambda x: x["volume_24h"], reverse=True)
+                top_items = filtered[:15]
+
+                candidates = []
+                for idx, item in enumerate(top_items):
+                    sym = item["symbol"]
+                    chg = item["price_change_24h"]
+                    vol = item["volume_24h"]
+                    adx_est = round(min(55.0, 22.0 + abs(chg) * 1.8), 1)
+                    trend_dir = "UP" if chg > 0 else "DOWN"
+                    breakout = abs(chg) >= 4.0
+                    z_score = round((chg / 4.0) + (vol / 50000000.0), 2)
+                    is_sel = (sym in static_symbols) or (idx < max_symbols)
+
+                    candidates.append({
+                        "symbol": sym,
+                        "name": sym.replace(quote, ""),
+                        "price": item["price"],
+                        "price_change_24h": chg,
+                        "volume_24h": vol,
+                        "volatility": item["volatility"],
+                        "adx": adx_est,
+                        "trend_dir": trend_dir,
+                        "breakout": breakout,
+                        "z_score": z_score,
+                        "momentum_rank": idx + 1,
+                        "is_selected": is_sel
+                    })
+
+                _scanned_cache["ts"] = now
+                _scanned_cache["data"] = candidates
+                return candidates
+    except Exception:
+        pass
+
+    return _scanned_cache["data"] or []
+
 
 def format_timestamp(ts_ms):
     if not ts_ms:
@@ -216,6 +510,7 @@ def format_timestamp(ts_ms):
     except Exception:
         return str(ts_ms)
 
+
 def render_dashboard(env_config, db_path):
     status_str = get_process_status()
     db_data = read_database(db_path)
@@ -224,59 +519,127 @@ def render_dashboard(env_config, db_path):
     paper_mode = env_config.get("PAPER_TRADE", "true").lower() == "true"
     preset = env_config.get("PRESET", "day")
     symbols = env_config.get("STATIC_SYMBOLS", "BTCUSDT,ETHUSDT")
+    quote = env_config.get("QUOTE_ASSET", "USDT")
+    control = read_control(env_config.get("CONTROL_FILE", "./data/engine_control.json"))
+    is_paused = control.get("paused", False)
+
+    # Fetch live balance and scanned pairs
+    balance_info = fetch_binance_balance(env_config, db_data)
+    scanned_pairs = fetch_scanned_pairs(env_config, db_data)
 
     output = []
-    output.append(f"{BOLD}{CYAN}========================================================================{RESET}")
-    output.append(f"{BOLD} BINANCE ULTIMATE BOT — LIVE CLI TERMINAL DASHBOARD {RESET}")
-    output.append(f"{BOLD}{CYAN}========================================================================{RESET}")
-    output.append(f"  Engine Status : {status_str}    Preset : {BOLD}{preset.upper()}{RESET}    Mode : {YELLOW if paper_mode else GREEN}{'PAPER TRADING' if paper_mode else 'LIVE PRODUCTION'}{RESET}")
-    output.append(f"  System Time   : {now_str}    Monitored Symbols : {CYAN}{symbols}{RESET}")
-    output.append(f"{CYAN}------------------------------------------------------------------------{RESET}")
+    output.append(f"{BOLD}{CYAN}========================================================================================{RESET}")
+    output.append(f"{BOLD} BINANCE ULTIMATE BOT — COMPREHENSIVE CLI MONITOR & SYSTEM STATUS {RESET}")
+    output.append(f"{BOLD}{CYAN}========================================================================================{RESET}")
+    mode_tag = f"{CYAN}[PAPER TRADING - SIMULATED]{RESET}" if paper_mode else f"{GREEN}{BOLD}[LIVE PRODUCTION - REAL FUNDS]{RESET}"
+    pause_tag = f" {RED}{BOLD}[WEB PAUSE ACTIVE]{RESET}" if is_paused else ""
+    output.append(f"  Engine Status : {status_str}{pause_tag}    Preset : {BOLD}{preset.upper()}{RESET}    Mode : {mode_tag}")
+    output.append(f"  System Time   : {now_str}       Monitored Symbols : {CYAN}{symbols}{RESET}")
+    output.append(f"{CYAN}----------------------------------------------------------------------------------------{RESET}")
 
-    if "error" in db_data:
-        output.append(f"  {YELLOW}Database info: {db_data['error']}{RESET}")
+    # Account Balance Section
+    total_eq = balance_info.get("total_equity", 0.0)
+    free_q = balance_info.get("free_quote", 0.0)
+    locked_q = balance_info.get("locked_quote", 0.0)
+    daily_pnl = balance_info.get("daily_pnl", 0.0)
+    pnl_color = GREEN if daily_pnl >= 0 else RED
+
+    output.append(f"{BOLD} 💰 ACCOUNT & BALANCE OVERVIEW{RESET}")
+    if paper_mode:
+        output.append(f"  Simulated Equity : {BOLD}${total_eq:,.2f} {quote}{RESET}    Daily Realized PnL : {pnl_color}${daily_pnl:+,.2f} {quote}{RESET}")
     else:
-        risk = db_data.get("risk", {})
-        daily_pnl = float(risk.get("daily_pnl", 0.0))
-        paper_bal = float(risk.get("paper_balance", 1000.0))
-        pnl_color = GREEN if daily_pnl >= 0 else RED
+        output.append(f"  Total Spot Equity : {BOLD}${total_eq:,.2f} {quote}{RESET}    Available Free Quote : {BOLD}${free_q:,.2f} {quote}{RESET}")
+        output.append(f"  In Open Positions : ${locked_q:,.2f} {quote}          Daily Realized PnL   : {pnl_color}${daily_pnl:+,.2f} {quote}{RESET}")
 
-        output.append(f"{BOLD} ACCOUNT & RISK OVERVIEW{RESET}")
-        if paper_mode:
-            output.append(f"  Simulated Equity : {BOLD}${paper_bal:.2f} USDT{RESET}    Daily PnL : {pnl_color}${daily_pnl:+.2f} USDT{RESET}")
-        else:
-            output.append(f"  Daily PnL        : {pnl_color}${daily_pnl:+.2f} USDT{RESET}")
+        # Non-zero asset balances
+        balances = balance_info.get("balances", [])
+        if balances:
+            asset_strs = []
+            for b in balances[:6]:
+                a = b["asset"]
+                tot = b["total"]
+                u_val = b.get("usd_value", 0.0)
+                if a == quote:
+                    asset_strs.append(f"{a}: {tot:,.2f}")
+                else:
+                    asset_strs.append(f"{a}: {tot:.4f} (${u_val:,.1f})")
+            output.append(f"  Assets Breakdown  : {' | '.join(asset_strs)}")
 
-        trades = db_data.get("trades", [])
-        output.append(f"\n{BOLD} ACTIVE POSITIONS ({len(trades)}){RESET}")
-        if not trades:
-            output.append(f"  {DIM}No open positions currently active.{RESET}")
-        else:
-            header = f"  {'SYMBOL':<10} {'SIDE':<6} {'ENTRY':<12} {'QTY':<10} {'STOP':<12} {'TP':<12} {'BE':<5}"
-            output.append(f"{BOLD}{header}{RESET}")
-            output.append("  " + "-" * 70)
-            for t in trades:
-                be = "YES" if t.get("breakeven_activated") else "NO"
-                output.append(f"  {BOLD}{t['symbol']:<10}{RESET} {GREEN if t['side']=='BUY' else RED}{t['side']:<6}{RESET} {t['entry_price']:<12.4f} {t['quantity']:<10.4f} {t.get('stop_price', 0):<12.4f} {t.get('take_profit', 0):<12.4f} {be:<5}")
+    # Scanned Pairs Section (Live Screener)
+    output.append(f"\n{BOLD} 🔍 MARKET SCANNER — TOP SCANNED PAIRS ({len(scanned_pairs)}){RESET}")
+    if not scanned_pairs:
+        output.append(f"  {DIM}Scanner initializing or waiting for next market cycle...{RESET}")
+    else:
+        hdr = f"  {'#':<3} {'SYMBOL':<10} {'PRICE':<12} {'24H CHG':<10} {'24H VOL':<12} {'ADX':<6} {'TREND':<7} {'BREAKOUT':<9} {'STATUS':<10}"
+        output.append(f"{BOLD}{hdr}{RESET}")
+        output.append("  " + "-" * 82)
+        for idx, s in enumerate(scanned_pairs[:8]):
+            chg = s.get("price_change_24h", 0.0)
+            chg_c = GREEN if chg >= 0 else RED
+            chg_str = f"{chg:+.2f}%"
+            vol_m = f"${s.get('volume_24h', 0) / 1e6:.1f}M"
+            status_badge = f"{GREEN}● ACTIVE{RESET}" if s.get("is_selected") else f"{DIM}WATCHING{RESET}"
+            bo_str = "YES" if s.get("breakout") else "NO"
+            p_val = s.get("price", 0.0)
+            p_str = f"${p_val:,.4f}" if p_val < 10 else f"${p_val:,.2f}"
+            output.append(
+                f"  {idx+1:<3} {BOLD}{s.get('symbol'):<10}{RESET} {p_str:<12} {chg_c}{chg_str:<10}{RESET} {vol_m:<12} {s.get('adx', 0):<6.1f} {s.get('trend_dir', 'N/A'):<7} {bo_str:<9} {status_badge}"
+            )
 
-        orders = db_data.get("orders", [])
-        output.append(f"\n{BOLD} RECENT ORDERS & FILLS (LAST 5){RESET}")
-        if not orders:
-            output.append(f"  {DIM}No recorded orders yet.{RESET}")
-        else:
-            header = f"  {'TIME':<19} {'SYMBOL':<10} {'SIDE':<6} {'PRICE':<10} {'QTY':<10} {'STATUS':<10}"
-            output.append(f"{BOLD}{header}{RESET}")
-            output.append("  " + "-" * 70)
-            for o in orders:
-                t_str = format_timestamp(o.get("created_at"))
-                s_color = GREEN if o["status"] == "FILLED" else (YELLOW if o["status"] == "NEW" else RED)
-                output.append(f"  {t_str:<19} {o['symbol']:<10} {o['side']:<6} {o.get('price', 0):<10.2f} {o.get('executed_qty', 0):<10.4f} {s_color}{o['status']:<10}{RESET}")
+    # Active Positions
+    trades = db_data.get("trades", [])
+    output.append(f"\n{BOLD} 📈 ACTIVE MARKET POSITIONS ({len(trades)}){RESET}")
+    if not trades:
+        output.append(f"  {DIM}No open positions currently active.{RESET}")
+    else:
+        hdr = f"  {'SYMBOL':<10} {'SIDE':<6} {'ENTRY':<12} {'QTY':<10} {'NOTIONAL':<12} {'STOP LOSS':<12} {'TAKE PROFIT':<12} {'BE':<5}"
+        output.append(f"{BOLD}{hdr}{RESET}")
+        output.append("  " + "-" * 82)
+        for t in trades:
+            be = "LOCKED" if t.get("breakeven_activated") else "NO"
+            side_c = GREEN if t["side"] == "BUY" else RED
+            notional = float(t.get("entry_price", 0)) * float(t.get("quantity", 0))
+            output.append(
+                f"  {BOLD}{t['symbol']:<10}{RESET} {side_c}{t['side']:<6}{RESET} {t['entry_price']:<12.4f} {t['quantity']:<10.4f} ${notional:<11.2f} {t.get('stop_price', 0):<12.4f} {t.get('take_profit', 0):<12.4f} {be:<5}"
+            )
 
-    output.append(f"\n{CYAN}------------------------------------------------------------------------{RESET}")
-    output.append(f"  {DIM}Press Ctrl+C to exit monitor. Run 'pm2 logs ultimate-bot' for indicator debug streams.{RESET}")
-    output.append(f"{CYAN}========================================================================{RESET}")
+    # Recent Orders
+    orders = db_data.get("orders", [])
+    output.append(f"\n{BOLD} 📋 RECENT EXECUTED ORDERS (LAST 5){RESET}")
+    if not orders:
+        output.append(f"  {DIM}No recorded orders yet.{RESET}")
+    else:
+        hdr = f"  {'TIME':<19} {'SYMBOL':<10} {'SIDE':<6} {'PRICE':<10} {'QTY':<10} {'STATUS':<10} {'REALIZED PNL':<12}"
+        output.append(f"{BOLD}{hdr}{RESET}")
+        output.append("  " + "-" * 82)
+        for o in orders[:5]:
+            t_str = format_timestamp(o.get("created_at"))
+            s_color = GREEN if o["status"] == "FILLED" else (YELLOW if o["status"] == "NEW" else RED)
+            pnl_val = float(o.get("profit_loss") or 0.0)
+            pnl_s = f"{pnl_val:+.2f} USDT" if pnl_val != 0 else "-"
+            output.append(
+                f"  {t_str:<19} {o['symbol']:<10} {o['side']:<6} {o.get('price', 0):<10.2f} {o.get('executed_qty', 0):<10.4f} {s_color}{o['status']:<10}{RESET} {pnl_s:<12}"
+            )
+
+    # Risk Metrics & Performance Stats
+    stats = db_data.get("stats", {})
+    risk = db_data.get("risk", {})
+    win_streak = risk.get("win_streak", "0")
+    loss_streak = risk.get("loss_streak", "0")
+    max_dd = float(env_config.get("MAX_DAILY_DRAWDOWN", "0.05")) * 100
+    win_rate = stats.get("win_rate", 0.0)
+
+    output.append(f"\n{BOLD} 🛡️ RISK METRICS & PERFORMANCE STATS{RESET}")
+    output.append(f"  Win Rate       : {BOLD}{win_rate:.1f}%{RESET} ({stats.get('winning_trades', 0)} wins / {stats.get('closed_trades', 0)} closed trades)")
+    output.append(f"  Streak Monitor : Win Streak: {GREEN}{win_streak}{RESET}/{env_config.get('MAX_WIN_STREAK', '3')}    Loss Streak: {RED}{loss_streak}{RESET}/{env_config.get('MAX_LOSS_STREAK', '2')}")
+    output.append(f"  Total Realized : {GREEN if stats.get('total_realized_pnl', 0)>=0 else RED}${stats.get('total_realized_pnl', 0):+,.2f} {quote}{RESET}    Daily DD Limit : {max_dd:.1f}%")
+
+    output.append(f"\n{CYAN}----------------------------------------------------------------------------------------{RESET}")
+    output.append(f"  {DIM}Press Ctrl+C to exit monitor. Run 'python3 status.py --web' to host the Web UI.{RESET}")
+    output.append(f"{CYAN}========================================================================================{RESET}")
 
     return "\n".join(output)
+
 
 def get_standalone_html():
     return """<!DOCTYPE html>
@@ -284,58 +647,176 @@ def get_standalone_html():
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Ultimate Binance Bot - Web Monitor</title>
+  <title>⚡ Ultimate Binance Bot - Web Monitor</title>
   <style>
-    :root { --bg: #0b0f19; --card: #151d2e; --border: #243049; --text: #e2e8f0; --accent: #10b981; --danger: #f43f5e; --warn: #f59e0b; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: var(--bg); color: var(--text); margin: 0; padding: 20px; }
-    .container { max-width: 1100px; margin: 0 auto; }
-    .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 15px; margin-bottom: 20px; }
-    .title { font-size: 1.25rem; font-weight: 700; color: #fff; }
-    .badge { padding: 4px 10px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }
+    :root {
+      --bg: #0b0f19;
+      --card: #151d2e;
+      --border: #243049;
+      --text: #e2e8f0;
+      --accent: #10b981;
+      --danger: #f43f5e;
+      --warn: #f59e0b;
+      --cyan: #38bdf8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 24px 16px;
+    }
+    .container { max-width: 1200px; margin: 0 auto; }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 16px;
+      margin-bottom: 24px;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .title { font-size: 1.4rem; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 8px; }
+    .badge {
+      padding: 6px 14px;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
     .badge-running { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
     .badge-stopped { background: rgba(244, 63, 94, 0.15); color: #fb7185; border: 1px solid rgba(244, 63, 94, 0.3); }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; margin-bottom: 20px; }
-    .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 15px; }
-    .card-title { font-size: 0.75rem; text-transform: uppercase; color: #94a3b8; margin-bottom: 6px; letter-spacing: 0.05em; }
-    .card-value { font-size: 1.35rem; font-weight: 700; color: #fff; }
-    table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.85rem; }
-    th { text-align: left; padding: 8px 12px; color: #94a3b8; border-bottom: 1px solid var(--border); }
-    td { padding: 8px 12px; border-bottom: 1px solid rgba(36, 48, 73, 0.5); }
-    .pnl-pos { color: #34d399; }
-    .pnl-neg { color: #fb7185; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-bottom: 24px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 18px;
+      position: relative;
+    }
+    .card-title { font-size: 0.75rem; text-transform: uppercase; color: #94a3b8; margin-bottom: 8px; letter-spacing: 0.05em; }
+    .card-value { font-size: 1.6rem; font-weight: 700; color: #fff; }
+    .card-sub { font-size: 0.8rem; color: #94a3b8; margin-top: 6px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.85rem; }
+    th { text-align: left; padding: 10px 12px; color: #94a3b8; border-bottom: 1px solid var(--border); font-size: 0.75rem; text-transform: uppercase; }
+    td { padding: 10px 12px; border-bottom: 1px solid rgba(36, 48, 73, 0.5); }
+    .pnl-pos { color: #34d399; font-weight: 600; }
+    .pnl-neg { color: #fb7185; font-weight: 600; }
     .time { font-size: 0.75rem; color: #64748b; }
+    .controls-bar {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 24px;
+      flex-wrap: wrap;
+    }
+    button {
+      background: #1e293b;
+      color: #fff;
+      border: 1px solid var(--border);
+      padding: 8px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.85rem;
+      transition: all 0.2s ease;
+    }
+    button:hover { background: #334155; }
+    button.btn-danger { background: rgba(244, 63, 94, 0.2); border-color: rgba(244, 63, 94, 0.4); color: #fb7185; }
+    button.btn-danger:hover { background: rgba(244, 63, 94, 0.4); }
+    button.btn-warn { background: rgba(245, 158, 11, 0.2); border-color: rgba(245, 158, 11, 0.4); color: #fbbf24; }
+    button.btn-warn:hover { background: rgba(245, 158, 11, 0.4); }
+    .asset-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .asset-chip {
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 0.75rem;
+    }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
       <div>
-        <div class="title">⚡ Binance Ultimate Trading Bot - Live Web Monitor</div>
+        <div class="title">⚡ Binance Ultimate Trading Bot — Web Monitor</div>
         <div id="timestamp" class="time">Connecting to engine...</div>
       </div>
-      <div id="statusBadge" class="badge badge-running">CHECKING...</div>
+      <div style="display:flex; align-items:center; gap: 12px;">
+        <div id="modeBadge" class="badge" style="background:#0284c7; color:#fff;">CHECKING...</div>
+        <div id="statusBadge" class="badge badge-running">CHECKING...</div>
+      </div>
     </div>
+
+    <!-- Quick Control Bar -->
+    <div class="controls-bar">
+      <button id="btnPause" class="btn-warn" onclick="togglePause()">⏸️ Pause Bot Entries</button>
+      <button class="btn-danger" onclick="closeAllPositions()">🚨 Emergency Close All</button>
+      <span id="controlStatus" style="font-size: 0.85rem; color: #94a3b8; align-self: center;"></span>
+    </div>
+
+    <!-- Balance & Risk Cards -->
     <div class="grid">
-      <div class="card"><div class="card-title">Trading Mode</div><div id="tradingMode" class="card-value">-</div></div>
-      <div class="card"><div class="card-title">Strategy Preset</div><div id="preset" class="card-value">-</div></div>
-      <div class="card"><div class="card-title">Signal Threshold</div><div id="signalThresh" class="card-value">-</div></div>
-      <div class="card"><div class="card-title">Daily Realized PnL</div><div id="dailyPnl" class="card-value">-</div></div>
+      <div class="card">
+        <div class="card-title">Total Account Equity</div>
+        <div id="totalEquity" class="card-value">—</div>
+        <div id="equitySub" class="card-sub">Available Quote: —</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Daily Realized PnL</div>
+        <div id="dailyPnl" class="card-value">—</div>
+        <div id="pnlSub" class="card-sub">Win Rate: —</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Active Positions & Capital</div>
+        <div id="openPositionsCount" class="card-value">0</div>
+        <div id="activeCapitalSub" class="card-sub">Locked Capital: $0.00</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Strategy Engine</div>
+        <div id="strategyPreset" class="card-value">—</div>
+        <div id="presetSub" class="card-sub">Signal Threshold: —</div>
+      </div>
     </div>
-    <div class="card" style="margin-bottom: 20px;">
-      <div class="card-title">Active Market Positions</div>
+
+    <!-- Non-Zero Assets Breakdown -->
+    <div class="card" style="margin-bottom: 24px;" id="assetsContainer">
+      <div class="card-title">Account Non-Zero Assets Breakdown</div>
+      <div id="assetChips" class="asset-chips">No non-zero assets recorded yet.</div>
+    </div>
+
+    <!-- Market Scanner / Scanned Pairs Screener -->
+    <div class="card" style="margin-bottom: 24px;">
+      <div class="card-title">🔍 Market Trend Scanner — Scanned Pairs</div>
+      <div id="scannedTable">Loading scanner...</div>
+    </div>
+
+    <!-- Active Positions -->
+    <div class="card" style="margin-bottom: 24px;">
+      <div class="card-title">📈 Active Market Positions</div>
       <div id="positionsTable">Loading positions...</div>
     </div>
+
+    <!-- Recent Orders -->
     <div class="card">
-      <div class="card-title">Recent Orders & Fills</div>
+      <div class="card-title">📋 Recent Orders & Executions</div>
       <div id="ordersTable">Loading orders...</div>
     </div>
   </div>
+
   <script>
+    let isPaused = false;
+
     async function updateStatus() {
       try {
         const res = await fetch('/api/status');
         const data = await res.json();
         document.getElementById('timestamp').innerText = 'Last updated: ' + data.timestamp + ' • Auto-refreshes every 2s';
+
+        // Engine status badge
         const badge = document.getElementById('statusBadge');
         if (data.process.includes('RUNNING')) {
           badge.className = 'badge badge-running';
@@ -344,16 +825,66 @@ def get_standalone_html():
           badge.className = 'badge badge-stopped';
           badge.innerText = '● ENGINE STOPPED';
         }
-        document.getElementById('tradingMode').innerText = data.config.PAPER_TRADE === 'true' ? 'PAPER (Simulated)' : 'LIVE REAL FUNDS';
-        document.getElementById('tradingMode').style.color = data.config.PAPER_TRADE === 'true' ? '#38bdf8' : '#fbbf24';
-        document.getElementById('preset').innerText = (data.config.PRESET || 'DAY').toUpperCase();
-        document.getElementById('signalThresh').innerText = (data.config.SIGNAL_THRESHOLD || '4') + ' / 5 Confluence';
-        const pnlVal = data.data.risk ? parseFloat(data.data.risk.daily_pnl || 0) : 0;
+
+        // Mode badge
+        const modeEl = document.getElementById('modeBadge');
+        const isLive = data.config.PAPER_TRADE !== 'true';
+        modeEl.innerText = isLive ? 'LIVE SPOT REAL FUNDS' : 'PAPER SIMULATOR';
+        modeEl.style.background = isLive ? '#15803d' : '#0369a1';
+
+        // Pause state
+        isPaused = Boolean(data.control && data.control.paused);
+        const pauseBtn = document.getElementById('btnPause');
+        if (isPaused) {
+          pauseBtn.innerText = '▶️ Resume Trading';
+          pauseBtn.className = 'btn-warn';
+          document.getElementById('controlStatus').innerText = '⏸️ Bot entries paused by operator';
+        } else {
+          pauseBtn.innerText = '⏸️ Pause Bot Entries';
+          pauseBtn.className = '';
+          document.getElementById('controlStatus').innerText = '✅ Bot actively trading';
+        }
+
+        // Balances
+        const bal = data.balance || {};
+        const eqVal = bal.total_equity !== undefined ? parseFloat(bal.total_equity) : 0;
+        const freeVal = bal.free_quote !== undefined ? parseFloat(bal.free_quote) : eqVal;
+        const lockVal = bal.locked_quote !== undefined ? parseFloat(bal.locked_quote) : 0;
+        const quote = bal.quote_asset || 'USDT';
+
+        document.getElementById('totalEquity').innerText = '$' + eqVal.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' ' + quote;
+        document.getElementById('equitySub').innerText = 'Free: $' + freeVal.toFixed(2) + ' • Locked: $' + lockVal.toFixed(2);
+
+        // Daily PnL
+        const pnlVal = bal.daily_pnl !== undefined ? parseFloat(bal.daily_pnl) : (data.data?.risk?.daily_pnl ? parseFloat(data.data.risk.daily_pnl) : 0);
         const pnlEl = document.getElementById('dailyPnl');
-        pnlEl.innerText = (pnlVal >= 0 ? '+' : '') + pnlVal.toFixed(2) + ' USDT';
+        pnlEl.innerText = (pnlVal >= 0 ? '+' : '') + '$' + pnlVal.toFixed(2) + ' ' + quote;
         pnlEl.className = 'card-value ' + (pnlVal >= 0 ? 'pnl-pos' : 'pnl-neg');
 
-        const trades = data.data.trades || [];
+        const stats = data.data?.stats || {};
+        document.getElementById('pnlSub').innerText = 'Win Rate: ' + (stats.win_rate || 0) + '% (' + (stats.winning_trades || 0) + ' wins)';
+
+        // Strategy preset
+        document.getElementById('strategyPreset').innerText = (data.config.PRESET || 'DAY').toUpperCase();
+        document.getElementById('presetSub').innerText = 'Signal Threshold: ' + (data.config.SIGNAL_THRESHOLD || '4') + '/5 • TF: ' + (data.config.TIMEFRAME || '15m');
+
+        // Assets Chips
+        const balances = bal.balances || data.data?.balances || [];
+        if (balances.length > 0) {
+          let chipsHtml = '';
+          balances.forEach(b => {
+            const tot = parseFloat(b.total || (b.free + b.locked) || 0);
+            const usd = b.usd_value ? ' ($' + parseFloat(b.usd_value).toFixed(1) + ')' : '';
+            chipsHtml += `<div class="asset-chip"><strong>${b.asset}</strong>: ${tot.toFixed(4)}${usd}</div>`;
+          });
+          document.getElementById('assetChips').innerHTML = chipsHtml;
+        }
+
+        // Active Trades
+        const trades = data.data?.trades || [];
+        document.getElementById('openPositionsCount').innerText = trades.length;
+        document.getElementById('activeCapitalSub').innerText = 'Locked: $' + lockVal.toFixed(2) + ' ' + quote;
+
         if (trades.length === 0) {
           document.getElementById('positionsTable').innerHTML = '<div style="color: #64748b; padding: 12px;">No active open positions.</div>';
         } else {
@@ -365,13 +896,34 @@ def get_standalone_html():
           document.getElementById('positionsTable').innerHTML = html;
         }
 
-        const orders = data.data.orders || [];
+        // Market Screener Table
+        const candidates = data.candidates || data.scanned_pairs || data.data?.scanned_pairs || [];
+        if (candidates.length === 0) {
+          document.getElementById('scannedTable').innerHTML = '<div style="color: #64748b; padding: 12px;">Scanner awaiting next cycle.</div>';
+        } else {
+          let html = '<table><thead><tr><th>#</th><th>Symbol</th><th>Price</th><th>24h Change</th><th>24h Volume</th><th>ADX</th><th>Trend</th><th>Breakout</th><th>Status</th></tr></thead><tbody>';
+          candidates.slice(0, 10).forEach((c, idx) => {
+            const chg = parseFloat(c.price_change_24h || 0);
+            const chgColor = chg >= 0 ? '#34d399' : '#fb7185';
+            const volStr = '$' + (parseFloat(c.volume_24h || 0) / 1e6).toFixed(1) + 'M';
+            const status = c.is_selected ? '<span style="color:#34d399; font-weight:bold;">● ACTIVE</span>' : '<span style="color:#64748b;">WATCH</span>';
+            const bo = c.breakout ? '<span style="color:#fbbf24; font-weight:bold;">YES</span>' : 'NO';
+            html += `<tr><td>${idx+1}</td><td><strong>${c.symbol}</strong></td><td>$${parseFloat(c.price||0).toFixed(2)}</td><td style="color:${chgColor}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</td><td>${volStr}</td><td>${parseFloat(c.adx||0).toFixed(1)}</td><td>${c.trend_dir||'UP'}</td><td>${bo}</td><td>${status}</td></tr>`;
+          });
+          html += '</tbody></table>';
+          document.getElementById('scannedTable').innerHTML = html;
+        }
+
+        // Recent Orders
+        const orders = data.data?.orders || [];
         if (orders.length === 0) {
           document.getElementById('ordersTable').innerHTML = '<div style="color: #64748b; padding: 12px;">No recent orders recorded.</div>';
         } else {
-          let html = '<table><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Price</th><th>Qty</th><th>Status</th></tr></thead><tbody>';
-          orders.forEach(o => {
-            html += `<tr><td class="time">${o.created_at || '-'}</td><td><strong>${o.symbol}</strong></td><td style="color:${o.side==='BUY'?'#34d399':'#fb7185'}">${o.side}</td><td>$${parseFloat(o.price||0).toFixed(2)}</td><td>${parseFloat(o.executed_qty||0).toFixed(4)}</td><td><span style="color:#34d399">${o.status}</span></td></tr>`;
+          let html = '<table><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Price</th><th>Qty</th><th>Status</th><th>Realized PnL</th></tr></thead><tbody>';
+          orders.slice(0, 8).forEach(o => {
+            const pnl = parseFloat(o.profit_loss || 0);
+            const pnlStr = pnl !== 0 ? `<span style="color:${pnl>=0?'#34d399':'#fb7185'}">${pnl>=0?'+':''}${pnl.toFixed(2)} USDT</span>` : '-';
+            html += `<tr><td class="time">${o.created_at || '-'}</td><td><strong>${o.symbol}</strong></td><td style="color:${o.side==='BUY'?'#34d399':'#fb7185'}">${o.side}</td><td>$${parseFloat(o.price||0).toFixed(2)}</td><td>${parseFloat(o.executed_qty||0).toFixed(4)}</td><td><span style="color:#34d399">${o.status}</span></td><td>${pnlStr}</td></tr>`;
           });
           html += '</tbody></table>';
           document.getElementById('ordersTable').innerHTML = html;
@@ -380,11 +932,48 @@ def get_standalone_html():
         console.error('Failed to fetch status', e);
       }
     }
+
+    async function togglePause() {
+      const action = isPaused ? 'resume' : 'pause';
+      try {
+        const res = await fetch('/api/control', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({action})
+        });
+        const d = await res.json();
+        if (d.ok) {
+          updateStatus();
+        }
+      } catch (e) {
+        alert('Failed to send control command: ' + e);
+      }
+    }
+
+    async function closeAllPositions() {
+      if (!confirm('Are you sure you want to close all open positions immediately at market?')) return;
+      try {
+        const res = await fetch('/api/control', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({action: 'close_all'})
+        });
+        const d = await res.json();
+        if (d.ok) {
+          alert('Emergency close command sent to engine.');
+          updateStatus();
+        }
+      } catch (e) {
+        alert('Failed to trigger emergency close: ' + e);
+      }
+    }
+
     updateStatus();
     setInterval(updateStatus, 2000);
   </script>
 </body>
 </html>"""
+
 
 def start_web_server(port, env_config, db_path):
     dist_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "dist"))
@@ -398,7 +987,7 @@ def start_web_server(port, env_config, db_path):
                 super().__init__(*args, **kwargs)
 
         def log_message(self, format, *args):
-            pass  # Keep output quiet like a production server
+            pass  # Quiet production mode
 
         def send_cors_headers(self):
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -440,10 +1029,34 @@ def start_web_server(port, env_config, db_path):
                 clean_status = status_str.replace(GREEN, "").replace(RED, "").replace(YELLOW, "").replace(RESET, "")
                 safe_config = {k: v for k, v in env_config.items() if "KEY" not in k and "SECRET" not in k and "WEBHOOK" not in k}
                 control = read_control(env_config.get("CONTROL_FILE", "./data/engine_control.json"))
+
+                # Live balance and candidate symbols
+                balance_info = fetch_binance_balance(env_config, db_data)
+                candidates = fetch_scanned_pairs(env_config, db_data)
+
+                # Merge balance info into risk payload so legacy clients read total_equity automatically
+                risk_payload = dict(db_data.get("risk", {}))
+                risk_payload["total_equity"] = str(balance_info.get("total_equity", 0.0))
+                risk_payload["live_equity"] = str(balance_info.get("total_equity", 0.0))
+                risk_payload["paper_balance"] = str(balance_info.get("total_equity", 0.0))
+                risk_payload["free_quote"] = str(balance_info.get("free_quote", 0.0))
+                risk_payload["locked_quote"] = str(balance_info.get("locked_quote", 0.0))
+
                 payload = {
                     "process": clean_status,
                     "config": safe_config,
-                    "data": db_data,
+                    "balance": balance_info,
+                    "candidates": candidates,
+                    "scanned_pairs": candidates,
+                    "data": {
+                        "risk": risk_payload,
+                        "trades": db_data.get("trades", []),
+                        "orders": db_data.get("orders", []),
+                        "stats": db_data.get("stats", {}),
+                        "balance": balance_info,
+                        "scanned_pairs": candidates,
+                        "balances": balance_info.get("balances", [])
+                    },
                     "control": {
                         "paused": bool(control.get("paused", False)),
                         "pause_reason": control.get("pause_reason", "") or ""
@@ -455,8 +1068,6 @@ def start_web_server(port, env_config, db_path):
                 return
 
             if clean_path == "/api/logs":
-                # Stream the engine's own log file so the web Debug Console shows
-                # the real VPS process output, not a local simulation.
                 query = parse_qs(urlparse(self.path).query)
                 try:
                     lines = min(int(query.get("lines", ["120"])[0]), 500)
@@ -475,24 +1086,12 @@ def start_web_server(port, env_config, db_path):
                     "db_exists": os.path.exists(db_path),
                     "timestamp": datetime.now().isoformat()
                 }
-                data_bytes = json.dumps(payload).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_cors_headers()
-                self.send_header("Content-Length", str(len(data_bytes)))
-                self.end_headers()
-                self.wfile.write(data_bytes)
+                self._send_json(payload)
                 return
 
             if clean_path == "/api/config":
                 safe_config = {k: v for k, v in env_config.items() if "KEY" not in k and "SECRET" not in k and "WEBHOOK" not in k}
-                data_bytes = json.dumps(safe_config).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_cors_headers()
-                self.send_header("Content-Length", str(len(data_bytes)))
-                self.end_headers()
-                self.wfile.write(data_bytes)
+                self._send_json(safe_config)
                 return
 
             if has_dist:
@@ -511,10 +1110,6 @@ def start_web_server(port, env_config, db_path):
                 self.wfile.write(html_bytes)
 
         def do_POST(self):
-            """Interactive control surface for the web monitor:
-            - POST /api/control  {"action": pause|resume|close_all|close_symbol, "symbol": "..."}
-            - POST /api/config   {"env_file": "<generated .env content>"}
-            """
             clean_path = self.path.split("?")[0]
             body = self._read_json_body()
             if body is None:
@@ -561,7 +1156,6 @@ def start_web_server(port, env_config, db_path):
                 env_path = os.path.abspath(".env")
                 applied = apply_env_updates(env_path, updates)
                 result = {"ok": True, "applied": applied, "count": len(applied)}
-                # Gracefully reload the engine so tuning takes effect immediately.
                 if applied and shutil.which("pm2"):
                     try:
                         proc = subprocess.run(
@@ -597,6 +1191,7 @@ def start_web_server(port, env_config, db_path):
         print(f"\n{YELLOW}Stopping web monitor.{RESET}")
         server.server_close()
 
+
 def main():
     parser = argparse.ArgumentParser(description="Binance Bot CLI & Web Terminal Dashboard")
     parser.add_argument("--watch", "-w", action="store_true", help="Continuously refresh terminal every 2 seconds")
@@ -623,6 +1218,7 @@ def main():
             time.sleep(args.interval)
     except KeyboardInterrupt:
         print("\nExiting monitor.")
+
 
 if __name__ == "__main__":
     main()

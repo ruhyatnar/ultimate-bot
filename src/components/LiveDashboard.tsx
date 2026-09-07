@@ -19,7 +19,8 @@ import {
   BotConfig, 
   StrategyPreset,
   CandidateSymbol,
-  PushResult 
+  PushResult,
+  VpsBalanceData
 } from '../types';
 import { TuningControlBar } from './TuningControlBar';
 import { DynamicScreener } from './DynamicScreener';
@@ -48,6 +49,7 @@ interface LiveDashboardProps {
   lossStreak: number;
   dataSource?: 'vps' | 'simulator';
   vpsRiskAvailable?: boolean;
+  vpsBalance?: VpsBalanceData | null;
   isLossCooldown?: boolean;
   cooldownEndsAt?: number;
   vpsConnected?: boolean;
@@ -98,6 +100,7 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
   lossStreak,
   dataSource = 'vps',
   vpsRiskAvailable = false,
+  vpsBalance = null,
   isLossCooldown = false,
   cooldownEndsAt = 0,
   vpsConnected = false,
@@ -211,11 +214,19 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
                   ${equity.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                 </span>
                 <span className="text-xs text-slate-400">USDT</span>
+                {!config.paperTrade && (
+                  <span className="ml-auto text-[10px] font-bold px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                    LIVE SPOT
+                  </span>
+                )}
               </div>
               <div className="mt-2 flex items-center justify-between text-xs">
-                <span className="text-slate-400">Capital Active:</span>
+                <span className="text-slate-400">{!config.paperTrade && vpsBalance ? 'Available Free Quote:' : 'Capital Active:'}</span>
                 <span className="text-slate-300 font-semibold">
-                  {(config.balanceUsagePercent * 100).toFixed(0)}% (${(equity * config.balanceUsagePercent).toFixed(1)})
+                  {!config.paperTrade && vpsBalance 
+                    ? `$${vpsBalance.freeQuote.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                    : `${(config.balanceUsagePercent * 100).toFixed(0)}% ($${(equity * config.balanceUsagePercent).toFixed(1)})`
+                  }
                 </span>
               </div>
             </>
@@ -291,8 +302,25 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
         </div>
       </div>
 
-      {/* Dynamic Symbols Screener (Active when dynamicSymbols=true) */}
-      {config.dynamicSymbols && candidates.length > 0 && (
+      {/* Non-Zero Spot Balances Strip (Live Mode) */}
+      {!config.paperTrade && vpsBalance?.balances && vpsBalance.balances.length > 0 && (
+        <div className="bg-slate-800/60 border border-slate-700/60 rounded-xl px-4 py-3 text-xs flex flex-wrap items-center gap-2">
+          <span className="text-slate-400 font-medium mr-1 flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+            Spot Balances:
+          </span>
+          {vpsBalance.balances.slice(0, 8).map(b => (
+            <div key={b.asset} className="bg-slate-900/80 border border-slate-700/60 rounded-lg px-2.5 py-1 text-slate-300 flex items-center gap-1.5">
+              <span className="font-bold text-white">{b.asset}:</span>
+              <span>{(b.free + (b.locked || 0)).toFixed(4)}</span>
+              {b.usd_value ? <span className="text-slate-400">(${b.usd_value.toFixed(1)})</span> : null}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Dynamic Symbols Screener (Active when dynamicSymbols=true or candidates available) */}
+      {(config.dynamicSymbols || candidates.length > 0) && candidates.length > 0 && (
         <DynamicScreener
           candidates={candidates}
           config={config}

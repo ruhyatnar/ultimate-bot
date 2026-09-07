@@ -14,6 +14,7 @@ def load_config():
 
     config = {
         "API_KEY": os.getenv("BINANCE_API_KEY"),
+        "API_SECRET": os.getenv("BINANCE_API_SECRET"),
         "PRIVATE_KEY_PATH": private_key_path,
         "DB_PATH": os.getenv("DB_PATH", "./data/trading.db"),
         "CONTROL_FILE": os.getenv("CONTROL_FILE", "./data/engine_control.json"),

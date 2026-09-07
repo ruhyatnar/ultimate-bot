@@ -141,6 +141,22 @@ export interface VpsControlState {
   pauseReason?: string;
 }
 
+export interface VpsBalanceData {
+  totalEquity: number;
+  freeQuote: number;
+  lockedQuote: number;
+  quoteAsset: string;
+  isLive: boolean;
+  dailyPnl?: number;
+  balances?: Array<{
+    asset: string;
+    free: number;
+    locked: number;
+    total?: number;
+    usd_value?: number;
+  }>;
+}
+
 export interface PushResult {
   ok: boolean;
   message: string;

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from datetime import datetime
 import aiosqlite
 
@@ -13,6 +14,9 @@ class DatabaseManager:
         self._writer_task = None
 
     async def init(self):
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
         self.conn = await aiosqlite.connect(self.db_path, isolation_level=None)
         await self.conn.execute("PRAGMA foreign_keys = ON")
         await self.conn.execute("PRAGMA journal_mode = WAL")

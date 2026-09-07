@@ -47,7 +47,16 @@ class TrendDetector:
                 continue
             if volume < self.config["MIN_VOLUME_USDT"] or price_change < self.config["MIN_PRICE_CHANGE_PERCENT"] or volatility < self.config["MIN_VOLATILITY_PERCENT"]:
                 continue
-            candidates.append({"symbol": symbol, "volume": volume, "price_change": price_change, "volatility": volatility})
+            candidates.append({
+                "symbol": symbol,
+                "volume": volume,
+                "price_change": price_change,
+                "raw_price_change": float(t.get("priceChangePercent", 0.0)),
+                "volatility": volatility,
+                "last_price": last,
+                "high": high,
+                "low": low
+            })
         if not candidates:
             return self.config["STATIC_SYMBOLS"]
         candidates.sort(key=lambda x: x["volume"], reverse=True)
@@ -75,7 +84,27 @@ class TrendDetector:
         scored = self._calculate_z_scores(detailed)
         scored = await self._apply_correlation_penalty(scored)
         scored.sort(key=lambda x: x["final_score"], reverse=True)
+        self.last_scored = scored
         return [item["symbol"] for item in scored[:self.config["MAX_SYMBOLS"]]]
+
+    def get_last_scanned(self):
+        if not hasattr(self, "last_scored") or not self.last_scored:
+            return []
+        items = []
+        for idx, s in enumerate(self.last_scored):
+            items.append({
+                "symbol": s.get("symbol"),
+                "price": float(s.get("last_price", 0.0)),
+                "price_change_24h": float(s.get("raw_price_change", s.get("price_change", 0.0))),
+                "volume_24h": float(s.get("volume", 0.0)),
+                "volatility": float(s.get("volatility", 0.0)),
+                "adx": round(float(s.get("adx", 0.0)), 2),
+                "trend_dir": str(s.get("trend_dir", "NEUTRAL")),
+                "breakout": bool(s.get("breakout", False)),
+                "z_score": round(float(s.get("final_score", 0.0)), 3),
+                "momentum_rank": idx + 1
+            })
+        return items
 
     def _to_df(self, klines):
         df = pd.DataFrame(klines, columns=['open_time','open','high','low','close','volume','close_time','quote_volume','trades','taker_buy_base','taker_buy_quote','ignore'])

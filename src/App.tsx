@@ -9,7 +9,8 @@ import {
   CandidateSymbol,
   VpsBotStatus,
   VpsControlState,
-  PushResult
+  PushResult,
+  VpsBalanceData
 } from './types';
 import { analyzeCandles } from './utils/technicalAnalysis';
 import { TAKER_FEE_RATE, MIN_NOTIONAL_USDT, BREAKEVEN_FEE_MULTIPLIER, effectiveAllocation, generateEnvString } from './utils/envGenerator';
@@ -177,6 +178,7 @@ export default function App() {
   vpsStatusRef.current = vpsStatus;
 
   const [vpsPushResult, setVpsPushResult] = useState<PushResult | null>(null);
+  const [vpsBalance, setVpsBalance] = useState<VpsBalanceData | null>(null);
 
   const [activeTrades, setActiveTrades] = useState<ActiveTrade[]>([]);
   const [closedTrades, setClosedTrades] = useState<ClosedTrade[]>([]);
@@ -402,15 +404,37 @@ export default function App() {
         });
       }
 
-      // Update Risk state from SQLite. The server's risk_state table is the single
-      // source of truth here — the dashboard never invents simulator numbers in VPS mode.
+      // Update Risk & Comprehensive Balance state from VPS.
+      // Supports both paper simulated equity and live production (PAPER_TRADE=false) with Spot balances.
       const r = json.data?.risk;
-      const hasDaily = r && r.daily_pnl !== undefined && !isNaN(parseFloat(r.daily_pnl));
-      const hasBalance = r && r.paper_balance !== undefined && !isNaN(parseFloat(r.paper_balance));
+      const b = json.balance || json.data?.balance;
+      
+      if (b) {
+        setVpsBalance({
+          totalEquity: parseFloat(b.total_equity || b.equity || 0),
+          freeQuote: parseFloat(b.free_quote || b.total_equity || 0),
+          lockedQuote: parseFloat(b.locked_quote || 0),
+          quoteAsset: b.quote_asset || 'USDT',
+          isLive: Boolean(b.is_live),
+          dailyPnl: b.daily_pnl !== undefined ? parseFloat(b.daily_pnl) : undefined,
+          balances: Array.isArray(b.balances) ? b.balances : []
+        });
+      }
+
+      const rawEq = b?.total_equity ?? b?.equity ?? r?.total_equity ?? r?.live_equity ?? r?.equity ?? r?.paper_balance;
+      const hasBalance = rawEq !== undefined && rawEq !== null && !isNaN(parseFloat(rawEq));
+      const hasDaily = (r && r.daily_pnl !== undefined && !isNaN(parseFloat(r.daily_pnl))) ||
+                       (b && b.daily_pnl !== undefined && !isNaN(parseFloat(b.daily_pnl)));
+
       setVpsRiskAvailable(Boolean(hasDaily || hasBalance));
+      if (hasBalance) {
+        setEquity(parseFloat(rawEq));
+      }
+      if (hasDaily) {
+        const dVal = r?.daily_pnl !== undefined ? parseFloat(r.daily_pnl) : parseFloat(b.daily_pnl);
+        setDailyRealizedPnl(dVal);
+      }
       if (r) {
-        if (hasDaily) setDailyRealizedPnl(parseFloat(r.daily_pnl));
-        if (hasBalance) setEquity(parseFloat(r.paper_balance));
         if (r.win_streak !== undefined) {
           const val = parseInt(r.win_streak || '0', 10);
           if (!isNaN(val)) setWinStreak(val);
@@ -529,6 +553,30 @@ export default function App() {
           staticSymbols: staticList && staticList.length > 0 ? staticList : prev.staticSymbols,
           dynamicSymbols: dynamicSym !== null ? dynamicSym : prev.dynamicSymbols
         }));
+      }
+
+      // Sync dynamic scanned candidates from VPS
+      const rawCandidates = json.candidates || json.scanned_pairs || json.data?.scanned_pairs;
+      if (Array.isArray(rawCandidates) && rawCandidates.length > 0) {
+        const mappedCandidates: CandidateSymbol[] = rawCandidates.map((c: any, idx: number) => {
+          const sym = String(c.symbol || '').toUpperCase();
+          const meta = getSymbolMeta(sym);
+          const price = parseFloat(c.price || c.last_price || meta.basePrice);
+          ensureCandlesForSymbol(sym, price);
+          return {
+            symbol: sym,
+            name: meta.name || c.name || sym,
+            price,
+            priceChange24h: parseFloat(c.price_change_24h ?? c.priceChangePercent ?? c.raw_price_change ?? 0),
+            volume24h: parseFloat(c.volume_24h ?? c.volume ?? 0),
+            volatility: parseFloat(c.volatility || 0),
+            adx: parseFloat(c.adx || 0),
+            zScore: parseFloat(c.z_score ?? c.final_score ?? 0),
+            isSelected: Boolean(c.is_selected ?? ((configRef.current.staticSymbols || []).includes(sym) || idx < (configRef.current.maxSymbols || 5))),
+            momentumRank: c.momentum_rank || (idx + 1)
+          };
+        });
+        setCandidates(mappedCandidates);
       }
 
       // Trigger immediate UI refresh for symbols and tickers
@@ -1250,6 +1298,7 @@ export default function App() {
             isLossCooldown={isLossCooldown}
             cooldownEndsAt={cooldownEndsAt}
             vpsConnected={vpsStatus.connected}
+            vpsBalance={vpsBalance}
             onPushConfigToVps={pushConfigToVps}
             vpsPushResult={vpsPushResult}
             controlPaused={vpsControl.paused}

@@ -33,22 +33,53 @@ class RiskManager:
             await self._fetch_equity()
 
     async def _fetch_equity(self):
-        account = await self.rest.get_account()
-        total_equity = 0.0
-        for b in account["balances"]:
-            asset = b["asset"]
-            free = float(b["free"]) + float(b["locked"])
-            if free <= 0: continue
-            if asset == self.config["QUOTE_ASSET"]:
-                total_equity += free
-            else:
-                symbol = asset + self.config["QUOTE_ASSET"]
-                try:
-                    ticker = await self.rest.get_ticker(symbol)
-                    total_equity += free * float(ticker["price"])
-                except Exception:
-                    pass
-        self.total_equity = total_equity
+        try:
+            account = await self.rest.get_account()
+            total_equity = 0.0
+            free_quote = 0.0
+            locked_quote = 0.0
+            balances_summary = []
+            quote = self.config.get("QUOTE_ASSET", "USDT")
+
+            for b in account.get("balances", []):
+                asset = b.get("asset", "")
+                free = float(b.get("free", 0.0))
+                locked = float(b.get("locked", 0.0))
+                total = free + locked
+                if total <= 0:
+                    continue
+
+                usd_val = 0.0
+                if asset == quote:
+                    total_equity += total
+                    free_quote = free
+                    locked_quote = locked
+                    usd_val = total
+                else:
+                    symbol = asset + quote
+                    try:
+                        ticker = await self.rest.get_ticker(symbol)
+                        price = float(ticker.get("price", 0.0))
+                        usd_val = total * price
+                        total_equity += usd_val
+                    except Exception:
+                        usd_val = 0.0
+
+                balances_summary.append({
+                    "asset": asset,
+                    "free": free,
+                    "locked": locked,
+                    "total": total,
+                    "usd_value": usd_val
+                })
+
+            self.total_equity = total_equity
+            self.free_quote = free_quote
+            self.locked_quote = locked_quote
+            self.balances_summary = balances_summary
+            self.logger.info(f"Live account equity updated: ${self.total_equity:.2f} {quote} (Free {quote}: ${self.free_quote:.2f})")
+        except Exception as e:
+            self.logger.warning(f"Could not fetch live account equity from exchange: {e}")
 
     async def save_state(self):
         await self.db.set_risk_state("daily_pnl", str(self.daily_pnl))
@@ -57,9 +88,23 @@ class RiskManager:
         await self.db.set_risk_state("unrealized_pnl", str(self.unrealized_pnl))
         for symbol, state in self.symbol_states.items():
             await self.db.set_risk_state(f"risk_{symbol}", json.dumps(state))
-        if self.config.get("PAPER_TRADE", False):
-            self.paper_balance = self.total_equity
-            await self.db.set_risk_state("paper_balance", str(self.paper_balance))
+
+        # Always persist live & total equity so all monitors (CLI, status.py, web npx) sync accurately
+        await self.db.set_risk_state("total_equity", str(self.total_equity))
+        await self.db.set_risk_state("live_equity", str(self.total_equity))
+        await self.db.set_risk_state("equity", str(self.total_equity))
+
+        free_q = getattr(self, "free_quote", self.total_equity)
+        locked_q = getattr(self, "locked_quote", 0.0)
+        await self.db.set_risk_state("free_quote", str(free_q))
+        await self.db.set_risk_state("locked_quote", str(locked_q))
+
+        # Mirror paper_balance so any client reading paper_balance stays in sync regardless of mode
+        self.paper_balance = self.total_equity
+        await self.db.set_risk_state("paper_balance", str(self.paper_balance))
+
+        if hasattr(self, "balances_summary") and self.balances_summary:
+            await self.db.set_risk_state("account_balances", json.dumps(self.balances_summary))
 
     async def check_risk(self, symbol, unrealized_pnl=0.0):
         self.unrealized_pnl = unrealized_pnl
@@ -167,6 +212,16 @@ class RiskManager:
             qty_dec = min(qty_dec, Decimal(str(filters["LOT_SIZE"]["maxQty"])))
 
         order_cost = float(qty_dec) * entry_price
+        if order_cost < min_notional:
+            qty_step_up = qty_dec + step_size
+            cost_step_up = float(qty_step_up) * entry_price
+            if (free_quote is None or cost_step_up <= free_quote) and cost_step_up <= float(self.total_equity):
+                qty_dec = qty_step_up
+                order_cost = cost_step_up
+            else:
+                self.logger.warning(f"Calculated cost {order_cost:.2f} USDT is below minNotional {min_notional} for {symbol}. Order skipped.")
+                return 0.0
+
         if free_quote is not None and order_cost > free_quote:
             self.logger.warning(
                 f"Calculated cost {order_cost:.2f} USDT exceeds available free quote ({free_quote:.2f} USDT) for {symbol}. Skipped."
