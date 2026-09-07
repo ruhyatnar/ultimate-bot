@@ -977,6 +977,10 @@ def get_standalone_html():
 
 def start_web_server(port, env_config, db_path):
     dist_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "dist"))
+    if not (os.path.isdir(dist_dir) and os.path.isfile(os.path.join(dist_dir, "index.html"))):
+        alt_dist = os.path.abspath("dist")
+        if os.path.isdir(alt_dist) and os.path.isfile(os.path.join(alt_dist, "index.html")):
+            dist_dir = alt_dist
     has_dist = os.path.isdir(dist_dir) and os.path.isfile(os.path.join(dist_dir, "index.html"))
 
     class CustomHandler(SimpleHTTPRequestHandler):
