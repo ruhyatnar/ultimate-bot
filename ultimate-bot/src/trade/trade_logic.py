@@ -1,5 +1,7 @@
 import asyncio
+import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -14,7 +16,7 @@ class TradeLogic:
         self.trend_detector = trend_detector
         self.db = db
         self.rest = rest
-        self.ws_stream = ws_stream
+        self.ws_stream = self._ws_stream_proxy(ws_stream, self.rest)
         self.webhook = webhook
         self.health_check = health_check
         self.logger = logging.getLogger(__name__)
@@ -24,6 +26,101 @@ class TradeLogic:
         self.cooldown = 10
         self.last_atr_update = {}
         self.last_exchange_sync_time = 0
+        # Remote-control channel: the web monitor (status.py) writes this JSON
+        # file; the engine polls it every cycle. Supports pause/resume and
+        # one-shot close_all / close_symbol commands (deduped via command_id).
+        self.control_file = config.get("CONTROL_FILE", "./data/engine_control.json")
+        self._control = {}
+        self._control_mtime = 0.0
+        self._last_command_id = None
+
+    def _read_control(self):
+        """Read the control file only when it changed (cheap mtime check)."""
+        try:
+            mtime = os.path.getmtime(self.control_file)
+            if mtime == self._control_mtime:
+                return self._control
+            with open(self.control_file, "r", encoding="utf-8") as f:
+                self._control = json.load(f)
+            self._control_mtime = mtime
+        except FileNotFoundError:
+            self._control = {}
+            self._control_mtime = 0.0
+        except Exception as e:
+            self.logger.warning(f"Could not read engine control file {self.control_file}: {e}")
+            self._control = {}
+            self._control_mtime = 0.0
+        return self._control
+
+    def _write_control(self, data):
+        """Atomically persist control state (used to clear executed commands)."""
+        try:
+            os.makedirs(os.path.dirname(self.control_file) or ".", exist_ok=True)
+            tmp = self.control_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, self.control_file)
+            self._control = data
+            self._control_mtime = os.path.getmtime(self.control_file)
+        except Exception as e:
+            self.logger.error(f"Failed to write engine control file: {e}")
+
+    async def _process_control_commands(self):
+        """Execute one-shot remote commands (close_all / close_symbol) exactly once.
+        Commands are idempotent: closing a symbol with no open trade is a no-op."""
+        control = self._read_control()
+        cmd_id = control.get("command_id")
+        if not cmd_id or cmd_id == self._last_command_id:
+            return
+        self._last_command_id = cmd_id
+        if control.get("close_all"):
+            open_symbols = list(self.active_trades.keys())
+            self.logger.warning(f"REMOTE CONTROL: closing ALL active positions ({len(open_symbols)})")
+            await self.webhook.send(f"🛑 REMOTE CONTROL: Close ALL requested ({len(open_symbols)} positions).")
+            for symbol in open_symbols:
+                await self.close_trade(symbol, "REMOTE_CLOSE_ALL")
+            control.pop("close_all", None)
+            control.pop("command_id", None)
+            self._write_control(control)
+        elif control.get("close_symbol"):
+            symbol = str(control.get("close_symbol", "")).strip().upper()
+            self.logger.warning(f"REMOTE CONTROL: closing {symbol}")
+            await self.webhook.send(f"🛑 REMOTE CONTROL: Close {symbol} requested.")
+            await self.close_trade(symbol, "REMOTE_CLOSE")
+            control.pop("close_symbol", None)
+            control.pop("command_id", None)
+            self._write_control(control)
+
+    def _ws_stream_proxy(self, stream, rest):
+        """Wrap the stream client so price reads transparently fall back to REST
+        when the public WebSocket is disconnected or the tick cache is stale."""
+        class _StreamProxy:
+            def __init__(self, stream, rest):
+                self._stream = stream
+                self._rest = rest
+
+            async def _fallback_price(self, symbol):
+                try:
+                    ticker = await self._rest.get_ticker(symbol)
+                    return float(ticker["price"])
+                except Exception:
+                    return None
+
+            async def get_current_price(self, symbol):
+                price = None
+                if self._stream is not None and self._stream.is_connected():
+                    price = await self._stream.get_current_price(symbol)
+                if not price:
+                    price = await self._fallback_price(symbol)
+                return price
+
+            def is_connected(self):
+                return self._stream is not None and self._stream.is_connected()
+
+            def __getattr__(self, name):
+                return getattr(self._stream, name)
+
+        return _StreamProxy(stream, rest)
 
     def _is_valid_symbol(self, symbol):
         base = symbol[:-len(self.config["QUOTE_ASSET"])] if symbol.endswith(self.config["QUOTE_ASSET"]) else symbol
@@ -66,6 +163,24 @@ class TradeLogic:
 
     async def run(self):
         while True:
+            # Remote web-monitor commands first so emergency closes always win
+            # over every other gate below.
+            await self._process_control_commands()
+
+            control = self._read_control()
+            if control.get("paused"):
+                # Web-monitor pause: block NEW entries but keep managing open
+                # positions so stops/TPs/trailing stays armed while the operator
+                # reviews the market.
+                self.logger.info("Web-monitor pause ACTIVE — new entries blocked; managing open positions only.")
+                for symbol in list(self.active_trades.keys()):
+                    try:
+                        await self.manage_trade(symbol)
+                    except Exception as e:
+                        self.logger.error(f"Error managing {symbol} during web pause: {e}")
+                await asyncio.sleep(self.config["SIGNAL_INTERVAL"])
+                continue
+
             if self.health_check and self.health_check.pause_trading:
                 self.logger.warning("Trading paused by health check")
                 await asyncio.sleep(30)
@@ -114,12 +229,16 @@ class TradeLogic:
         self.symbol_cooldowns[symbol] = time.time() + self.cooldown
 
     async def enter_trade(self, symbol, signal, atr):
+        # Professional guard: only process long entries in spot mode.
+        if signal != "BUY":
+            self.logger.debug(f"{symbol}: enter_trade called with signal={signal}; spot long-only engine ignores it.")
+            return
+        # Professional guard: hard cap total capital deployed (equity * BALANCE_USAGE_PERCENT).
+        deployed = sum(t["quantity"] * t["entry_price"] for t in self.active_trades.values())
         price = await self.ws_stream.get_current_price(symbol)
         if not price:
-            try:
-                ticker = await self.rest.get_ticker(symbol)
-                price = float(ticker["price"])
-            except: return
+            self.logger.warning(f"{symbol}: no live price available (WS stale & REST ticker failed); skipping entry.")
+            return
         entry_price = price
         stop_price = entry_price - atr * self.config["ATR_MULTIPLIER_SL"]
         take_profit = entry_price + atr * self.config["ATR_MULTIPLIER_TP"]
@@ -129,6 +248,14 @@ class TradeLogic:
         side = "BUY"
 
         qty = await self.risk_mgr.calculate_position_size(symbol, entry_price, stop_price)
+        if not qty or qty <= 0:
+            self.logger.info(f"{symbol}: position size 0 (equity/fee/minNotional caps) — entry skipped.")
+            return
+        # Enforce the total-capital cap after sizing (planned notional vs remaining headroom)
+        remaining = self.config["BALANCE_USAGE_PERCENT"] * self.risk_mgr.total_equity - deployed
+        if qty * entry_price > remaining:
+            self.logger.info(f"{symbol}: planned notional ${qty * entry_price:.2f} exceeds remaining allocation headroom ${remaining:.2f}; skipping entry.")
+            return
         order_id = await self.order_mgr.place_market_order(symbol, side, qty, expected_price=entry_price)
         if order_id is None: return
         self.logger.info(f"Entry market order placed: {order_id} for {symbol}")
@@ -171,7 +298,8 @@ class TradeLogic:
             try:
                 ticker = await self.rest.get_ticker(symbol)
                 price = float(ticker["price"])
-            except: return
+            except Exception:
+                return
         now = time.time()
         if symbol not in self.last_atr_update or (now - self.last_atr_update[symbol]) > 1800:
             klines = await self.rest.get_klines(symbol, self.config["TIMEFRAME"], 100)
@@ -182,6 +310,27 @@ class TradeLogic:
                     self.last_atr_update[symbol] = now
 
         if trade["side"] == "BUY":
+            # Gap-breach protection: compare against the LOW of the bar, not just the
+            # current tick. A tick-based check alone misses violent wicks that spike
+            # through the stop between SIGNAL_INTERVAL polls and bounce back — the #1
+            # cause of unexpected deep losses in live market-only bots.
+            recent = await self.rest.get_klines(symbol, self.config["TIMEFRAME"], 2)
+            if recent:
+                try:
+                    df = pd.DataFrame(recent, columns=['open_time','open','high','low','close','volume','close_time','quote_volume','trades','taker_buy_base','taker_buy_quote','ignore'])
+                    low = float(df['low'].iloc[-1])
+                    high = float(df['high'].iloc[-1])
+                except Exception:
+                    low = price
+                    high = price
+                if low <= trade["stop_price"]:
+                    # Fill at the worse of stop or actual low — conservative live fill assumption
+                    await self.close_trade(symbol, "STOP_LOSS", fill_override=min(trade["stop_price"], low))
+                    return
+                if high >= trade["take_profit"]:
+                    await self.close_trade(symbol, "TAKE_PROFIT", fill_override=trade["take_profit"])
+                    return
+            # Tick-level check as immediate backstop
             if price <= trade["stop_price"]:
                 await self.close_trade(symbol, "STOP_LOSS"); return
             if price >= trade["take_profit"]:
@@ -227,32 +376,68 @@ class TradeLogic:
         atr = tr.rolling(self.config["ATR_PERIOD"]).mean().iloc[-1]
         return atr if not pd.isna(atr) else 0
 
-    async def close_trade(self, symbol, reason):
+    async def close_trade(self, symbol, reason, fill_override=None):
         trade = self.active_trades.pop(symbol, None)
-        if not trade: return
-        exit_side = "SELL"
-        exit_order_id = await self.order_mgr.place_market_order(symbol, exit_side, trade["quantity"])
-        if exit_order_id is None:
-            self.logger.error(f"Failed to place exit order for {symbol}. Position remains!")
-            self.active_trades[symbol] = trade
+        if not trade:
             return
-        filled, executed_qty = await self.order_mgr.wait_for_fill(symbol, exit_order_id, timeout=10)
-        if not filled:
-            self.logger.warning(f"Exit order {exit_order_id} not filled? Keeping position.")
+        original_qty = trade["quantity"]
+        try:
+            exit_side = "SELL"
+            exit_order_id = await self.order_mgr.place_market_order(symbol, exit_side, original_qty)
+            if exit_order_id is None:
+                # Failsafe: never silently drop a position we intended to close.
+                # Re-arm the stop locally and alert loudly — the next manage_trade pass
+                # (or sync_positions_from_exchange) retries the liquidation.
+                self.active_trades[symbol] = trade
+                self.symbol_cooldowns[symbol] = time.time() + self.cooldown
+                self.logger.critical(f"{symbol}: EXIT ORDER REJECTED ({reason}). Position remains open with stop ${trade['stop_price']:.4f}. Will retry next cycle.")
+                await self.webhook.send(f"🚨 CRITICAL: exit order REJECTED for {symbol} ({reason}). Position remains open — retrying. Stop: {trade['stop_price']:.4f}")
+                return
+            filled, executed_qty = await self.order_mgr.wait_for_fill(symbol, exit_order_id, timeout=10)
+            if not filled:
+                self.logger.warning(f"Exit order {exit_order_id} not filled? Keeping position.")
+                self.active_trades[symbol] = trade
+                return
+        except Exception as e:
+            # CRITICAL SAFETY NET: an exception between pop and re-arm would lose
+            # the position from memory while it stays open on the exchange — stops
+            # stop being monitored and a duplicate long could be entered. Re-arm
+            # the trade and alert loudly so the next cycle retries the exit.
             self.active_trades[symbol] = trade
+            self.symbol_cooldowns[symbol] = time.time() + self.cooldown
+            self.logger.critical(f"{symbol}: EXIT FAILED with exception ({reason}): {e}. Position re-armed; will retry next cycle. Stop: {trade['stop_price']:.4f}")
+            await self.webhook.send(f"🚨 CRITICAL: exit FAILED for {symbol} ({reason}): {e}. Position re-armed — retrying. Stop: {trade['stop_price']:.4f}")
             return
 
         fill_price = None
-        if self.config["PAPER_TRADE"]:
+        if fill_override:
+            fill_price = fill_override
+        elif not self.config["PAPER_TRADE"]:
+            # Live mode: use the exchange's actual average fill price so slippage
+            # on market exits is captured in PnL (ticker-based PnL is inaccurate).
+            try:
+                order_info = await self.rest.get_order(symbol, exit_order_id)
+                avg = float(order_info.get("avgPrice", 0) or 0)
+                if avg > 0:
+                    fill_price = avg
+            except Exception as e:
+                self.logger.warning(f"Could not fetch exit avg fill price: {e}")
+        else:
             row = await self.db.fetch_one("SELECT avg_fill_price FROM orders WHERE order_id = ?", (exit_order_id,))
             fill_price = float(row[0]) if row and row[0] else None
         if not fill_price:
-            fill_price = await self.ws_stream.get_current_price(symbol)
-            if not fill_price:
-                ticker = await self.rest.get_ticker(symbol)
-                fill_price = float(ticker["price"])
+            try:
+                fill_price = await self.ws_stream.get_current_price(symbol)
+                if not fill_price:
+                    ticker = await self.rest.get_ticker(symbol)
+                    fill_price = float(ticker["price"])
+            except Exception as e:
+                # Last resort: zero-gross assumption (fees still deducted) rather
+                # than letting PnL accounting crash the exit finalization.
+                self.logger.error(f"Could not resolve exit fill price for {symbol}: {e}")
+                fill_price = trade["entry_price"]
 
-        remaining_qty = trade["quantity"] - executed_qty
+        remaining_qty = original_qty - executed_qty
 
         # Professional net PnL calculation deducting Binance spot exchange taker commissions (0.1% each leg)
         fee_rate = 0.001
@@ -269,13 +454,15 @@ class TradeLogic:
             except Exception:
                 pass
 
-        await self.db.update_order_status(exit_order_id, "FILLED", executed_qty, fill_price, profit_loss=pnl)
+        # Partial exit = the order was canceled after a partial fill; full exit = FILLED.
+        exit_status = "CANCELED" if remaining_qty > 0 else "FILLED"
+        await self.db.update_order_status(exit_order_id, exit_status, executed_qty, fill_price, profit_loss=pnl)
         if remaining_qty > 0:
             trade["quantity"] = remaining_qty
             self.active_trades[symbol] = trade
             await self.db.save_active_trade(trade)
             await self.risk_mgr.update_trade_result(pnl, symbol)
-            await self.webhook.send(f"⚠️ Partial exit for {symbol} ({reason}): {executed_qty} of {trade['quantity']} sold. Net PnL (after fees): {pnl:+.2f} USDT. Remaining {remaining_qty} units.")
+            await self.webhook.send(f"⚠️ Partial exit for {symbol} ({reason}): {executed_qty} of {original_qty} sold. Net PnL (after fees): {pnl:+.2f} USDT. Remaining {remaining_qty} units.")
             return
 
         await self.db.delete_active_trade(symbol)
@@ -331,7 +518,8 @@ class TradeLogic:
                 try:
                     ticker = await self.rest.get_ticker(symbol)
                     price = float(ticker["price"])
-                except: continue
+                except Exception:
+                    continue
             total += (price - trade["entry_price"]) * trade["quantity"]
         return total
 

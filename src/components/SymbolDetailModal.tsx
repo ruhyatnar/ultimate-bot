@@ -2,18 +2,14 @@ import React, { useState } from 'react';
 import { 
   X, 
   Activity, 
-  TrendingUp, 
-  TrendingDown, 
-  Shield, 
   Crosshair, 
   Zap, 
   CheckCircle2, 
   XCircle, 
-  DollarSign, 
-  Calculator,
-  ArrowRight
+  Calculator
 } from 'lucide-react';
 import { MarketSymbolData, BotConfig } from '../types';
+import { effectiveAllocation, MIN_NOTIONAL_USDT } from '../utils/envGenerator';
 
 interface SymbolDetailModalProps {
   symbolData: MarketSymbolData;
@@ -44,11 +40,12 @@ export const SymbolDetailModal: React.FC<SymbolDetailModalProps> = ({
   const trailingTrigger = price * (1 + config.trailingStopActivate);
   const breakevenTrigger = price * 1.01;
 
-  // Sizing estimation
-  const defaultAlloc = Math.min(equity * config.balanceUsagePercent, equity * config.maxSymbolAllocationPercent);
-  const [customAllocation, setCustomAllocation] = useState<number>(Math.round(defaultAlloc));
-  const estimatedQuantity = customAllocation / price;
-  const minNotionalValid = customAllocation >= 10.0;
+  // Sizing estimation — capped like the engine (total usage & per-symbol cap, 1% fee buffer)
+  const maxAlloc = Math.round(effectiveAllocation(config, equity));
+  const [customAllocation, setCustomAllocation] = useState<number>(maxAlloc);
+  const clampedAllocation = Math.min(Math.max(0, customAllocation), maxAlloc);
+  const estimatedQuantity = clampedAllocation / price;
+  const minNotionalValid = clampedAllocation >= MIN_NOTIONAL_USDT;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in">
@@ -272,21 +269,28 @@ export const SymbolDetailModal: React.FC<SymbolDetailModalProps> = ({
             </h4>
             <div className="flex flex-wrap items-center gap-3 text-xs">
               <div className="flex-1 min-w-[180px]">
-                <label className="text-[10px] text-slate-400 block mb-1">Simulated Allocation (USDT)</label>
+                <label className="text-[10px] text-slate-400 block mb-1">
+                  Simulated Allocation (USDT) — max ${maxAlloc.toFixed(0)}
+                </label>
                 <div className="flex items-center space-x-2">
                   <input
                     id="input-custom-allocation"
                     type="number"
-                    min="10"
-                    max={equity}
-                    value={customAllocation}
-                    onChange={(e) => setCustomAllocation(Math.max(10, parseFloat(e.target.value) || 10))}
+                    min={MIN_NOTIONAL_USDT}
+                    max={maxAlloc}
+                    value={clampedAllocation}
+                    onChange={(e) => setCustomAllocation(Math.min(maxAlloc, Math.max(MIN_NOTIONAL_USDT, parseFloat(e.target.value) || MIN_NOTIONAL_USDT)))}
                     className="bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-slate-100 font-mono w-32"
                   />
                   <span className="text-slate-400">
                     ≈ <strong className="text-slate-200 font-mono">{estimatedQuantity.toFixed(4)}</strong> {symbolData.symbol.replace('USDT', '')}
                   </span>
                 </div>
+                {!minNotionalValid && (
+                  <p className="text-[10px] text-amber-400 mt-1">
+                    Below Binance MIN_NOTIONAL (${MIN_NOTIONAL_USDT}) — a live order of this size would be rejected.
+                  </p>
+                )}
               </div>
 
               <div className="text-right">

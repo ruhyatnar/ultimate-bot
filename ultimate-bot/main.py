@@ -83,7 +83,17 @@ async def main():
 
     try:
         if not config["PAPER_TRADE"] and ws_api:
-            await ws_api.connect()
+            try:
+                await ws_api.connect()
+            except Exception as e:
+                # Order execution falls back to REST automatically (OrderManager
+                # checks is_connected()); do NOT let a WS API outage at startup
+                # kill the bot. HealthCheck keeps retrying the connection.
+                logger.error(f"WebSocket API unavailable at startup ({e}); continuing with REST-only order execution.")
+                try:
+                    await ws_api.disconnect()
+                except Exception:
+                    pass
 
         await trade_logic.update_symbols()
         await trade_logic.reconcile_positions()
@@ -94,10 +104,13 @@ async def main():
         except Exception as e:
             logger.warning(f"WebSocket stream initial connect issue (falling back to REST): {e}")
 
-        asyncio.create_task(health.run())
-        asyncio.create_task(trade_logic.run())
-        asyncio.create_task(trade_logic.refresh_symbols_loop())
-        asyncio.create_task(trade_logic.send_daily_report_loop())
+        # Keep strong references to background loops so they are never garbage-collected mid-run
+        background_tasks = [
+            asyncio.create_task(health.run()),
+            asyncio.create_task(trade_logic.run()),
+            asyncio.create_task(trade_logic.refresh_symbols_loop()),
+            asyncio.create_task(trade_logic.send_daily_report_loop()),
+        ]
 
         while not shutdown_event.is_set():
             await asyncio.sleep(1)

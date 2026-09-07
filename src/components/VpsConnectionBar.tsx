@@ -7,10 +7,10 @@ import {
   Settings2, 
   CheckCircle2, 
   AlertTriangle, 
-  ExternalLink,
-  ShieldCheck,
   Cpu,
-  Database
+  Database,
+  PauseCircle,
+  PlayCircle
 } from 'lucide-react';
 import { VpsBotStatus } from '../types';
 
@@ -22,6 +22,8 @@ interface VpsConnectionBarProps {
   onUpdateVpsEndpoint: (url: string) => void;
   onRefreshVps: () => void;
   isPolling: boolean;
+  controlPaused?: boolean;
+  onToggleVpsPause?: () => void;
 }
 
 export const VpsConnectionBar: React.FC<VpsConnectionBarProps> = ({
@@ -31,7 +33,9 @@ export const VpsConnectionBar: React.FC<VpsConnectionBarProps> = ({
   vpsEndpoint,
   onUpdateVpsEndpoint,
   onRefreshVps,
-  isPolling
+  isPolling,
+  controlPaused = false,
+  onToggleVpsPause
 }) => {
   const [showConfigModal, setShowConfigModal] = useState<boolean>(false);
   const [inputUrl, setInputUrl] = useState<string>(vpsEndpoint);
@@ -139,11 +143,36 @@ export const VpsConnectionBar: React.FC<VpsConnectionBarProps> = ({
                 </span>
               </div>
 
+              {/* Remote engine pause state */}
+              {controlPaused && (
+                <span className="inline-flex items-center space-x-1 text-amber-300 bg-amber-950/60 border border-amber-700/60 px-2 py-0.5 rounded-full font-semibold animate-pulse">
+                  <PauseCircle className="w-3 h-3" />
+                  <span>Engine Paused</span>
+                </span>
+              )}
+
               {/* Sync timestamp */}
               {vpsStatus.lastSyncTime && (
                 <span className="text-slate-400 text-[11px] hidden lg:inline">
                   Last Sync: {vpsStatus.lastSyncTime}
                 </span>
+              )}
+
+              {/* Remote pause / resume */}
+              {onToggleVpsPause && (
+                <button
+                  id="vps-bar-pause-btn"
+                  onClick={onToggleVpsPause}
+                  title={controlPaused ? 'Resume trading on the live engine' : 'Pause new entries on the live engine (open positions stay managed)'}
+                  className={`flex items-center space-x-1 px-2 py-1 rounded border text-[11px] font-semibold transition-colors ${
+                    controlPaused
+                      ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 hover:bg-amber-500 hover:text-white'
+                      : 'bg-slate-900 border-slate-800 text-slate-300 hover:text-white hover:bg-slate-800'
+                  }`}
+                >
+                  {controlPaused ? <PlayCircle className="w-3.5 h-3.5" /> : <PauseCircle className="w-3.5 h-3.5" />}
+                  <span className="hidden sm:inline">{controlPaused ? 'Resume' : 'Pause'}</span>
+                </button>
               )}
 
               {/* Manual refresh button */}

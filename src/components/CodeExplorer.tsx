@@ -6,14 +6,10 @@ import {
   Copy, 
   Check, 
   CheckCircle2, 
-  Sparkles,
-  ExternalLink,
-  ChevronRight,
-  ChevronDown,
-  FileText
+  Sparkles
 } from 'lucide-react';
 import JSZip from 'jszip';
-import { BOT_FILES, BotFileDefinition } from '../data/botFiles';
+import { BOT_FILES, INIT_PY } from '../data/botFiles';
 
 export const CodeExplorer: React.FC = () => {
   const [selectedPath, setSelectedPath] = useState<string>('main.py');
@@ -39,19 +35,12 @@ export const CodeExplorer: React.FC = () => {
         folder?.file(file.path, file.content);
       });
 
-      // Add placeholder directories and init files
+      // Add placeholder directories and package init files
       folder?.file('keys/private_key.pem', '# Place your Ed25519 private key here for live Binance trading');
+      folder?.file('keys/public_key.pem', '# Generate with: openssl pkey -in private_key.pem -pubout');
       folder?.file('data/.gitkeep', '');
       folder?.file('logs/.gitkeep', '');
-      folder?.file('src/__init__.py', '');
-      folder?.file('src/core/__init__.py', '');
-      folder?.file('src/exchange/__init__.py', '');
-      folder?.file('src/database/__init__.py', '');
-      folder?.file('src/risk/__init__.py', '');
-      folder?.file('src/strategies/__init__.py', '');
-      folder?.file('src/trade/__init__.py', '');
-      folder?.file('src/reporting/__init__.py', '');
-      folder?.file('src/utils/__init__.py', '');
+      folder?.file(INIT_PY, '');
 
       const blob = await zip.generateAsync({ type: 'blob' });
       const url = URL.createObjectURL(blob);

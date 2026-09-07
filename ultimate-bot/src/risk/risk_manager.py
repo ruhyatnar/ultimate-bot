@@ -46,7 +46,8 @@ class RiskManager:
                 try:
                     ticker = await self.rest.get_ticker(symbol)
                     total_equity += free * float(ticker["price"])
-                except: pass
+                except Exception:
+                    pass
         self.total_equity = total_equity
 
     async def save_state(self):

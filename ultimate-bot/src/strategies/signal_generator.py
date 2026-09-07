@@ -4,6 +4,11 @@ import numpy as np
 import pandas as pd
 
 class SignalGenerator:
+    # Cap the kline cache so dynamic screening over hundreds of symbols cannot grow
+    # memory without bound on long VPS runs. Evicts the oldest entries (FIFO) once
+    # the cap is hit; entries also expire after 60s via the timestamp check below.
+    KLINE_CACHE_MAX_ENTRIES = 64
+
     def __init__(self, config, rest):
         self.config = config
         self.rest = rest
@@ -24,6 +29,9 @@ class SignalGenerator:
             return None
         df = self._to_df(klines)
         self.klines_cache[key] = (now, df)
+        while len(self.klines_cache) > self.KLINE_CACHE_MAX_ENTRIES:
+            oldest_key = next(iter(self.klines_cache))
+            self.klines_cache.pop(oldest_key, None)
         return df
 
     async def generate_signal(self, symbol):

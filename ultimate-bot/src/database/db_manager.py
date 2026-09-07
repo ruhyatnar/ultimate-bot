@@ -16,6 +16,7 @@ class DatabaseManager:
         self.conn = await aiosqlite.connect(self.db_path, isolation_level=None)
         await self.conn.execute("PRAGMA foreign_keys = ON")
         await self.conn.execute("PRAGMA journal_mode = WAL")
+        await self.conn.execute("PRAGMA synchronous = NORMAL")
         await self.conn.execute("PRAGMA busy_timeout = 5000")
         self.read_conn = await aiosqlite.connect(self.db_path, isolation_level=None)
         await self.read_conn.execute("PRAGMA query_only = ON")

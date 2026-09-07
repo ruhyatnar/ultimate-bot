@@ -8,7 +8,6 @@ import {
   Activity, 
   FileCode2, 
   BookOpen, 
-  ShieldAlert,
   Zap,
   TrendingUp
 } from 'lucide-react';
@@ -26,6 +25,7 @@ interface HeaderProps {
   totalEquity: number;
   dataSource?: 'vps' | 'simulator';
   vpsConnected?: boolean;
+  isLossCooldown?: boolean;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -39,7 +39,8 @@ export const Header: React.FC<HeaderProps> = ({
   unrealizedPnl,
   totalEquity,
   dataSource = 'vps',
-  vpsConnected = false
+  vpsConnected = false,
+  isLossCooldown = false
 }) => {
   return (
     <header className="bg-slate-900 border-b border-slate-800 sticky top-0 z-30">
@@ -73,6 +74,11 @@ export const Header: React.FC<HeaderProps> = ({
                 }`}>
                   {config.paperTrade ? 'Paper Mode' : 'LIVE SPOT'}
                 </span>
+                {isLossCooldown && (
+                  <span className="px-2 py-0.5 text-xs font-semibold rounded-full bg-rose-500/15 text-rose-400 border border-rose-500/30 animate-pulse">
+                    ⏸ Cooldown
+                  </span>
+                )}
                 <span className="px-2 py-0.5 text-xs font-semibold rounded-full bg-slate-800 text-slate-300 border border-slate-700 capitalize hidden sm:inline">
                   {config.preset}
                 </span>

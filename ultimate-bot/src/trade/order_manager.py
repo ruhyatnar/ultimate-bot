@@ -69,58 +69,68 @@ class OrderManager:
             })
             return order_id
 
-        ticker = await self.rest.get_ticker(symbol)
-        current_price = float(ticker["price"])
-        if expected_price:
-            slippage = abs(current_price - expected_price) / expected_price * 100
-            if slippage > self.config["MAX_SLIPPAGE_PERCENT"]:
-                self.logger.warning(f"Slippage too high for {symbol}: {slippage:.2f}%")
-                return None
-        if side == "BUY":
-            account = await self.rest.get_account()
-            free_balance = next((float(b["free"]) for b in account.get("balances", []) if b["asset"] == self.config["QUOTE_ASSET"]), 0.0)
-            if quantity * current_price > free_balance:
-                self.logger.warning(f"Insufficient balance for {symbol}")
-                return None
-        elif side == "SELL":
-            account = await self.rest.get_account()
-            quote_asset = self.config.get("QUOTE_ASSET", "USDT")
-            base_asset = symbol[:-len(quote_asset)] if symbol.endswith(quote_asset) else symbol
-            free_base = next((float(b["free"]) for b in account.get("balances", []) if b["asset"] == base_asset), None)
-            if free_base is not None and free_base < float(quantity):
-                self.logger.info(f"Available {base_asset} ({free_base}) < requested sell qty ({quantity}) - adjusting sell qty to available balance.")
-                quantity = free_base
-
-        qty, _ = await self.sanitize_order(symbol, quantity, current_price)
-        if qty is None:
-            self.logger.warning(f"Order quantity sanitization failed for {symbol}; order skipped.")
-            return None
         try:
-            if self.ws_api and self.ws_api.is_connected():
-                resp = await self.ws_api.place_order(symbol, side, "MARKET", qty)
-                result = resp.get("result", {})
-                order_id = result.get("orderId")
-            else:
-                resp = await self.rest.place_order(symbol, side, "MARKET", qty)
-                result = resp
-                order_id = result.get("orderId")
-        except Exception as e:
-            self.logger.error(f"Order placement failed: {e}")
-            return None
+            ticker = await self.rest.get_ticker(symbol)
+            current_price = float(ticker["price"])
+            if expected_price:
+                slippage = abs(current_price - expected_price) / expected_price * 100
+                if slippage > self.config["MAX_SLIPPAGE_PERCENT"]:
+                    self.logger.warning(f"Slippage too high for {symbol}: {slippage:.2f}%")
+                    return None
+            if side == "SELL":
+                # Base-asset fee clamp: exchange deducts the taker fee from the received
+                # base asset when BNB fee-pay is off, so the true sellable balance is the
+                # free balance. Clamping instead of rejecting avoids -2010 on exits.
+                account = await self.rest.get_account()
+                quote_asset = self.config.get("QUOTE_ASSET", "USDT")
+                base_asset = symbol[:-len(quote_asset)] if symbol.endswith(quote_asset) else symbol
+                free_base = next((float(b["free"]) for b in account.get("balances", []) if b["asset"] == base_asset), None)
+                if free_base is not None and free_base < float(quantity):
+                    self.logger.info(f"Available {base_asset} ({free_base}) < requested sell qty ({quantity}) - adjusting sell qty to available balance.")
+                    quantity = free_base
+            else:  # BUY: pre-check free quote balance (1% fee/slippage buffer) to fail fast instead of a -2010 rejection
+                account = await self.rest.get_account()
+                free_quote = next((float(b["free"]) for b in account.get("balances", []) if b["asset"] == self.config["QUOTE_ASSET"]), 0.0)
+                if quantity * current_price > free_quote * 0.99:
+                    self.logger.warning(f"BUY rejected: notional ${quantity * current_price:.2f} exceeds 99% of free {self.config['QUOTE_ASSET']} (${free_quote:.2f}).")
+                    return None
 
-        if order_id is None:
-            self.logger.error("Failed to get orderId")
+            qty, _ = await self.sanitize_order(symbol, quantity, current_price)
+            if qty is None:
+                self.logger.warning(f"Order quantity sanitization failed for {symbol}; order skipped.")
+                return None
+            try:
+                if self.ws_api and self.ws_api.is_connected():
+                    resp = await self.ws_api.place_order(symbol, side, "MARKET", qty)
+                    result = resp.get("result", {})
+                    order_id = result.get("orderId")
+                else:
+                    resp = await self.rest.place_order(symbol, side, "MARKET", qty)
+                    result = resp
+                    order_id = result.get("orderId")
+            except Exception as e:
+                self.logger.error(f"Order placement failed: {e}")
+                return None
+
+            if order_id is None:
+                self.logger.error("Failed to get orderId")
+                return None
+            self.last_order_quantity = qty
+            await self.db.save_order({
+                "order_id": str(order_id), "symbol": symbol, "side": side, "order_type": "MARKET",
+                "price": result.get("price"), "stop_price": result.get("stopPrice"),
+                "quantity": qty, "executed_qty": result.get("executedQty", 0),
+                "status": result.get("status", "NEW"), "created_at": int(time.time()*1000),
+                "updated_at": int(time.time()*1000), "profit_loss": 0,
+                "avg_fill_price": result.get("avgPrice")
+            })
+            return str(order_id)
+        except Exception as e:
+            # Every failure mode (REST/WS outage, account fetch, filter lookup,
+            # sanitization) degrades to a clean skip. Callers treat `None` as
+            # "order not placed" and retry/re-arm — never an unhandled crash.
+            self.logger.error(f"Order preparation failed for {symbol} {side}: {e}")
             return None
-        self.last_order_quantity = qty
-        await self.db.save_order({
-            "order_id": str(order_id), "symbol": symbol, "side": side, "order_type": "MARKET",
-            "price": result.get("price"), "stop_price": result.get("stopPrice"),
-            "quantity": qty, "executed_qty": result.get("executedQty", 0),
-            "status": result.get("status", "NEW"), "created_at": int(time.time()*1000),
-            "updated_at": int(time.time()*1000), "profit_loss": 0,
-            "avg_fill_price": result.get("avgPrice")
-        })
-        return str(order_id)
 
     async def wait_for_fill(self, symbol, order_id, timeout=None):
         if self.paper_trade:
@@ -154,12 +164,27 @@ class OrderManager:
                     avg_fill_price = float(status.get("avgPrice", 0))
                     await self.db.update_order_status(order_id, "CANCELED", executed, avg_fill_price)
                     return True, executed
-        except: pass
+        except Exception:
+            pass
         try:
             if self.ws_api and self.ws_api.is_connected():
                 await self.ws_api.cancel_order(symbol, order_id)
             else:
                 await self.rest.cancel_order(symbol, order_id)
             await self.db.update_order_status(order_id, "CANCELED", 0)
-        except: pass
+        except Exception:
+            pass
+        # The cancel may have raced a fill (market orders can fill between the
+        # timeout poll and the cancel). Verify final state so a position that
+        # actually filled is never dropped from tracking.
+        try:
+            final = await self.rest.get_order(symbol, order_id)
+            if final["status"] == "FILLED":
+                executed = float(final.get("executedQty", 0))
+                avg = float(final.get("avgPrice", 0) or 0)
+                await self.db.update_order_status(order_id, "FILLED", executed, avg)
+                self.logger.info(f"Order {order_id} filled despite cancel attempt (race) — tracking {executed} units.")
+                return True, executed
+        except Exception:
+            pass
         return False, 0

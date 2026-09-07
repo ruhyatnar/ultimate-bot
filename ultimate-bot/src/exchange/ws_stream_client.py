@@ -18,16 +18,23 @@ class WSStreamClient:
         self.last_price = {}
         self.klines_cache = {}
         self._listen_task = None
+        self._reconnect_task = None
         self.max_klines_per_symbol = 500
         self._subscribed_symbols = set()
+
+    # Bound initial connect attempts so a dead network fails fast into REST fallback
+    # instead of hanging main() startup forever. Reconnect-after-drop uses its own
+    # longer backoff loop (_reconnect_loop).
+    MAX_CONNECT_ATTEMPTS = 5
 
     async def connect(self, symbols):
         if len(symbols) > 500:
             self.logger.warning(f"Too many symbols ({len(symbols)}). Limit to 500.")
             symbols = symbols[:500]
-        while True:
+        last_error = None
+        for attempt in range(1, self.MAX_CONNECT_ATTEMPTS + 1):
             try:
-                self.logger.info(f"Connecting to WebSocket Stream for symbols: {symbols}")
+                self.logger.info(f"Connecting to WebSocket Stream (attempt {attempt}/{self.MAX_CONNECT_ATTEMPTS}) for symbols: {symbols}")
                 self.websocket = await websockets.connect(self.stream_url, ping_interval=20, ping_timeout=10)
                 self.connected = True
                 streams = []
@@ -36,7 +43,7 @@ class WSStreamClient:
                     streams.append(f"{sym_lower}@aggTrade")
                     streams.append(f"{sym_lower}@kline_{self.config['TIMEFRAME']}")
                 await self.websocket.send(json.dumps({"method": "SUBSCRIBE", "params": streams, "id": 1}))
-                resp = await self.websocket.recv()
+                resp = await asyncio.wait_for(self.websocket.recv(), timeout=10)
                 if '"result":null' in resp and '"error"' in resp:
                     raise Exception(f"Subscription error: {resp}")
                 self._subscribed_symbols = set(symbols)
@@ -44,9 +51,15 @@ class WSStreamClient:
                 self._listen_task = asyncio.create_task(self._listen())
                 return
             except Exception as e:
-                self.logger.error(f"Stream connection failed: {e}")
+                last_error = e
+                self.logger.error(f"Stream connection attempt {attempt} failed: {e}")
                 await self.disconnect()
-                await asyncio.sleep(5)
+                if attempt < self.MAX_CONNECT_ATTEMPTS:
+                    await asyncio.sleep(min(2 ** attempt, 30))
+        self.logger.error(
+            f"WebSocket Stream unavailable after {self.MAX_CONNECT_ATTEMPTS} attempts ({last_error}). "
+            "Continuing with REST price polling; background reconnects will retry."
+        )
 
     async def subscribe(self, symbols):
         if not self.is_connected():
@@ -78,6 +91,13 @@ class WSStreamClient:
             self._subscribed_symbols.discard(s)
 
     async def disconnect(self):
+        if self._reconnect_task:
+            self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except asyncio.CancelledError:
+                pass
+            self._reconnect_task = None
         if self._listen_task:
             self._listen_task.cancel()
             try:
@@ -116,11 +136,39 @@ class WSStreamClient:
                 await self._process(data)
             except websockets.exceptions.ConnectionClosed:
                 self.connected = False
-                self.logger.warning("WebSocket Stream connection closed.")
-                asyncio.create_task(self.connect(list(self._subscribed_symbols)))
+                self.logger.warning("WebSocket Stream connection closed. Reconnecting...")
+                # Reconnect on a fresh socket object. Calling self.connect() directly
+                # here would block the listener and, worse, self.connect() reassigns
+                # self.websocket while this coroutine still holds the dead one.
+                self._reconnect_task = asyncio.create_task(
+                    self._reconnect_loop(list(self._subscribed_symbols))
+                )
                 break
             except asyncio.CancelledError:
                 break
+
+    async def _reconnect_loop(self, symbols):
+        """Exponential-backoff reconnect that always builds a fresh websocket.
+        NOTE: deliberately avoids self.disconnect() — it would cancel this very task."""
+        self.connected = False
+        if self._listen_task:
+            self._listen_task = None
+        for attempt in range(1, 8):
+            try:
+                if self.websocket:
+                    try:
+                        await self.websocket.close()
+                    except Exception:
+                        pass
+                    self.websocket = None
+                await self.connect(symbols)
+                if self.connected:
+                    self.logger.info("WebSocket Stream reconnected successfully.")
+                    return
+            except Exception as e:
+                self.logger.warning(f"Stream reconnect attempt {attempt} failed: {e}")
+            await asyncio.sleep(min(2 ** attempt, 60))
+        self.logger.error("WebSocket Stream reconnect abandoned after repeated failures; price reads fall back to REST.")
 
     async def _process(self, data):
         e = data.get("e")

@@ -1,148 +1,56 @@
 import React, { useState } from 'react';
 import { 
-  Sliders, 
-  Save, 
   Copy, 
   Check, 
-  RotateCcw, 
   Zap, 
   ShieldAlert, 
-  Sparkles,
   Layers,
-  Settings2,
-  FileText
+  FileText,
+  Send,
+  Loader2,
+  AlertTriangle,
+  CheckCircle2,
+  WifiOff
 } from 'lucide-react';
-import { BotConfig, StrategyPreset } from '../types';
+import { BotConfig, StrategyPreset, PushResult } from '../types';
+import { generateEnvString } from '../utils/envGenerator';
 
 interface ConfigTabProps {
   config: BotConfig;
   onUpdateConfig: (newConfig: BotConfig) => void;
   onApplyPreset: (preset: StrategyPreset) => void;
+  dataSource?: 'vps' | 'simulator';
+  vpsConnected?: boolean;
+  onPushToVps?: () => Promise<PushResult>;
 }
 
 export const ConfigTab: React.FC<ConfigTabProps> = ({
   config,
   onUpdateConfig,
-  onApplyPreset
+  onApplyPreset,
+  dataSource = 'vps',
+  vpsConnected = false,
+  onPushToVps
 }) => {
   const [copied, setCopied] = useState(false);
   const [savedNotice, setSavedNotice] = useState(false);
+  const [isPushing, setIsPushing] = useState(false);
+  const [pushResult, setPushResult] = useState<PushResult | null>(null);
 
-  const generateEnvString = () => {
-    return `# =================================================================
-# BINANCE API CREDENTIALS
-# =================================================================
-BINANCE_API_KEY=your_api_key_here
-BINANCE_PRIVATE_KEY_PATH=./keys/private_key.pem
-
-# =================================================================
-# DATABASE
-# =================================================================
-DB_PATH=./data/trading.db
-
-# =================================================================
-# PRESET MODE
-# =================================================================
-PRESET=${config.preset}
-
-# =================================================================
-# TRADING STRATEGY PARAMETERS
-# =================================================================
-TIMEFRAME=${config.timeframe}
-MTF_TIMEFRAME=${config.mtfTimeframe}
-ATR_PERIOD=${config.atrPeriod}
-ATR_MULTIPLIER_SL=${config.atrMultiplierSl}
-ATR_MULTIPLIER_TP=${config.atrMultiplierTp}
-TRAILING_STOP_ACTIVATE=${config.trailingStopActivate}
-TRAILING_STOP_CALLBACK=${config.trailingStopCallback}
-SWING_LOOKBACK=${config.swingLookback}
-MAX_SLIPPAGE_PERCENT=0.5
-MIN_TP_PERCENT=0.005
-SIGNAL_THRESHOLD=${config.signalThreshold}
-SIGNAL_INTERVAL=${config.signalInterval}
-
-# =================================================================
-# BALANCE USAGE
-# =================================================================
-BALANCE_USAGE_PERCENT=${config.balanceUsagePercent}
-MAX_SYMBOL_ALLOCATION_PERCENT=${config.maxSymbolAllocationPercent}
-
-# =================================================================
-# DYNAMIC SYMBOLS
-# =================================================================
-DYNAMIC_SYMBOLS=${config.dynamicSymbols}
-MAX_SYMBOLS=${config.maxSymbols}
-TOP_CANDIDATES=50
-MIN_VOLUME_USDT=1000000
-MIN_PRICE_CHANGE_PERCENT=0.5
-MIN_VOLATILITY_PERCENT=0.3
-EXCLUDE_SYMBOLS=USDC,BUSD,UP,DOWN,FDUSD,TUSD,DAI
-SYMBOL_REFRESH_INTERVAL=3600
-
-# =================================================================
-# ADVANCED TREND DETECTION
-# =================================================================
-ADX_THRESHOLD=${config.adxThreshold}
-ADX_PERIOD=${config.adxPeriod}
-Z_SCORE_WEIGHT_VOLUME=0.20
-Z_SCORE_WEIGHT_CHANGE=0.20
-Z_SCORE_WEIGHT_VOLATILITY=0.20
-Z_SCORE_WEIGHT_ADX=0.40
-CORRELATION_THRESHOLD=0.70
-CORRELATION_PENALTY=0.90
-TREND_LOOKBACK=20
-
-# =================================================================
-# TRADING PARAMETERS
-# =================================================================
-STATIC_SYMBOLS=${config.staticSymbols.join(',')}
-QUOTE_ASSET=USDT
-ORDER_TYPE=MARKET_ONLY
-BASE_ORDER_SIZE=0.001
-MAX_HOLD_TIME=${config.maxHoldTime}
-
-# =================================================================
-# RISK MANAGEMENT
-# =================================================================
-MAX_DAILY_DRAWDOWN=${config.maxDailyDrawdown}
-MAX_LOSS_STREAK=${config.maxLossStreak}
-MAX_WIN_STREAK=${config.maxWinStreak}
-COOLDOWN_LOSS=${config.cooldownLoss}
-COOLDOWN_WIN=${config.cooldownWin}
-
-# =================================================================
-# EXECUTION
-# =================================================================
-ENTRY_TIMEOUT=15
-
-# =================================================================
-# WEBHOOK & NOTIFICATION
-# =================================================================
-DISCORD_WEBHOOK_URL=${config.discordWebhookUrl}
-DISCORD_COOLDOWN=30
-
-# =================================================================
-# LOGGING
-# =================================================================
-LOG_LEVEL=${config.logLevel}
-LOG_FILE=./logs/trading.log
-
-# =================================================================
-# HEALTH CHECK & PERFORMANCE
-# =================================================================
-HEALTH_CHECK_INTERVAL=60
-REST_WEIGHT_LIMIT=1200
-
-# =================================================================
-# ENVIRONMENT
-# =================================================================
-PAPER_TRADE=${config.paperTrade}
-USE_TESTNET=${config.useTestnet}
-`;
+  const handlePushToVps = async () => {
+    if (!onPushToVps) return;
+    setIsPushing(true);
+    setPushResult(null);
+    try {
+      const result = await onPushToVps();
+      setPushResult(result);
+    } finally {
+      setIsPushing(false);
+    }
   };
 
   const handleCopyEnv = () => {
-    navigator.clipboard.writeText(generateEnvString());
+    navigator.clipboard.writeText(generateEnvString(config));
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
@@ -387,27 +295,58 @@ USE_TESTNET=${config.useTestnet}
               <span className="text-xs font-bold text-white font-mono">.env (Live Generator)</span>
             </div>
 
-            <button
-              onClick={handleCopyEnv}
-              className="flex items-center space-x-1.5 px-3 py-1.5 rounded-md text-xs font-semibold bg-slate-700 text-slate-200 hover:bg-slate-600 transition-colors"
-            >
-              {copied ? (
-                <>
-                  <Check className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>Copied</span>
-                </>
-              ) : (
-                <>
-                  <Copy className="w-3.5 h-3.5" />
-                  <span>Copy .env</span>
-                </>
+            <div className="flex items-center space-x-1.5">
+              {dataSource === 'vps' && onPushToVps && (
+                <button
+                  id="push-config-to-vps-btn"
+                  onClick={handlePushToVps}
+                  disabled={isPushing || !vpsConnected}
+                  title={vpsConnected ? 'Apply this tuned configuration to the live VPS engine' : 'Connect to the VPS web monitor first (VPS Connection Bar)'}
+                  className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition-colors ${
+                    vpsConnected
+                      ? 'bg-emerald-600 text-white hover:bg-emerald-500'
+                      : 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                  }`}
+                >
+                  {isPushing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : vpsConnected ? <Send className="w-3.5 h-3.5" /> : <WifiOff className="w-3.5 h-3.5" />}
+                  <span>{isPushing ? 'Applying...' : vpsConnected ? 'Push to VPS' : 'VPS Disconnected'}</span>
+                </button>
               )}
-            </button>
+              <button
+                onClick={handleCopyEnv}
+                className="flex items-center space-x-1.5 px-3 py-1.5 rounded-md text-xs font-semibold bg-slate-700 text-slate-200 hover:bg-slate-600 transition-colors"
+              >
+                {copied ? (
+                  <>
+                    <Check className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Copied</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3.5 h-3.5" />
+                    <span>Copy .env</span>
+                  </>
+                )}
+              </button>
+            </div>
           </div>
+
+          {pushResult && (
+            <div className={`p-3 border-b text-[11px] flex items-start space-x-2 ${
+              pushResult.ok
+                ? 'bg-emerald-950/60 border-emerald-800 text-emerald-300'
+                : 'bg-rose-950/60 border-rose-800 text-rose-300'
+            }`}>
+              {pushResult.ok
+                ? <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                : <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />}
+              <span>{pushResult.message}</span>
+            </div>
+          )}
 
           <div className="flex-1 p-4 overflow-auto font-mono text-xs text-slate-300 bg-slate-950/70 leading-relaxed scrollbar-thin">
             <pre>
-              <code>{generateEnvString()}</code>
+              <code>{generateEnvString(config)}</code>
             </pre>
           </div>
         </div>

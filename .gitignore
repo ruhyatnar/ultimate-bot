@@ -4,5 +4,25 @@ dist/
 coverage/
 .DS_Store
 *.log
+
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Trading engine runtime state & secrets — NEVER commit
+ultimate-bot/data/*.db
+ultimate-bot/data/*.db-*
+ultimate-bot/data/engine_control.json
+ultimate-bot/logs/*
+!ultimate-bot/logs/.gitkeep
+ultimate-bot/keys/*.pem
+ultimate-bot/.env
+
+# Env files (template allowed)
 .env*
 !.env.example
+
+# Build info
+*.tsbuildinfo
