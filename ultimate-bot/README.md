@@ -346,12 +346,11 @@ pm2 restart bot-web-monitor         # restart the web monitor
 
 # Option 2 — supervised 24/7 via PM2 (already in ecosystem.config.cjs)
 pm2 start ecosystem.config.cjs
-
-# Option 3 — prebuilt React dashboard (if a compiled ./dist exists next to status.py)
-npx serve -s dist -l 3000
 ```
 
-Then open `http://YOUR_VPS_IP:3000`. The React dashboard auto-connects to `/api/status` on the same origin, or you can point the **VPS Connection Bar** at any remote endpoint. If no compiled `dist/` is found, `status.py --web` falls back to a built-in standalone dark-mode dashboard that now includes a **Performance & Risk section** (win rate with W/L/B breakdown, profit factor, total realized PnL, average win/loss and the win/loss streak monitor) alongside the balance cards, market scanner, active positions and recent orders.
+Then open `http://YOUR_VPS_IP:3000`. When a compiled `./dist` exists next to `status.py`, it serves the React dashboard **with full `npx serve -s dist` parity** — SPA fallback for client-side routes, clean-URL directory redirects (301), ETag/`304` revalidation, immutable caching for content-hashed `/assets/*`, gzip compression, HTTP `Range` support and HTTP/1.1 keep-alive on a multi-threaded `ThreadingHTTPServer` (several viewers can poll simultaneously without blocking each other). No Node.js, `npx serve` or reverse proxy is required on the VPS.
+
+If no compiled `dist/` is found, `status.py --web` falls back to a built-in standalone dark-mode dashboard that includes a **Performance & Risk section** (win rate with W/L/B breakdown, profit factor, total realized PnL, average win/loss and the win/loss streak monitor) alongside the balance cards, market scanner, active positions and recent orders.
 
 > **Win-rate consistency**: wins, losses and breakevens are counted from **SELL exit orders that recorded a realized PnL** — never from BUY entries or un-filled orders — and the `win_rate` shown is `wins ÷ closed`. Partial-exit legs (recorded on `CANCELED` SELL orders) are included, so the numbers always reconcile with the engine's own streak and cooldown state.
 

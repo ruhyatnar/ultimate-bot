@@ -17,6 +17,8 @@ import json
 import uuid
 import sqlite3
 import argparse
+import gzip
+import mimetypes
 import shutil
 import subprocess
 import urllib.request
@@ -24,7 +26,7 @@ import urllib.parse
 import hmac
 import hashlib
 from datetime import datetime
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 # ANSI Color Codes for Terminal Display
@@ -315,7 +317,6 @@ def fetch_binance_balance(env_config, db_data):
     - If PAPER_TRADE=false: queries live Binance Spot API using HMAC or Ed25519 signing.
       Falls back cleanly to database risk_state if offline or rate-limited.
     """
-    global _balance_cache
     now = time.time()
     quote = env_config.get("QUOTE_ASSET", "USDT").strip().upper()
     paper_mode = env_config.get("PAPER_TRADE", "true").lower() == "true"
@@ -460,7 +461,6 @@ def fetch_scanned_pairs(env_config, db_data):
     1. Check SQLite risk_state for real engine-scanned pairs.
     2. If empty, query Binance public 24h ticker API to populate top gainers/active pairs.
     """
-    global _scanned_cache, _tickers_cache
     now = time.time()
 
     # If engine recently persisted scanned pairs in SQLite, return them
@@ -1109,6 +1109,12 @@ def start_web_server(port, env_config, db_path):
             else:
                 super().__init__(*args, **kwargs)
 
+        # HTTP/1.1 keep-alive (requires accurate Content-Length on every response,
+        # which every branch below provides) and an idle-connection timeout so
+        # keep-alive threads cannot accumulate forever.
+        protocol_version = "HTTP/1.1"
+        timeout = 60
+
         def log_message(self, format, *args):
             pass  # Quiet production mode
 
@@ -1118,8 +1124,10 @@ def start_web_server(port, env_config, db_path):
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 
         def do_OPTIONS(self):
+            # Content-Length is mandatory on HTTP/1.1 keep-alive responses
             self.send_response(200)
             self.send_cors_headers()
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
         def _send_json(self, obj, status=200):
@@ -1143,6 +1151,173 @@ def start_web_server(port, env_config, db_path):
                 return json.loads(raw.decode("utf-8"))
             except Exception:
                 return None
+
+        # ------------------------------------------------------------------
+        # Static file serving with full `npx serve -s dist` parity:
+        # SPA fallback for client-side routes, clean-URL directory redirects,
+        # ETag/304 revalidation, immutable caching for hashed assets, gzip
+        # compression, HTTP Range support and HTTP/1.1 keep-alive.
+        # ------------------------------------------------------------------
+        SERVE_COMPRESSIBLE_EXTS = {
+            ".html", ".htm", ".css", ".js", ".mjs", ".json", ".map", ".svg",
+            ".txt", ".xml", ".webmanifest", ".woff", ".woff2",
+        }
+
+        def _cache_control(self, fs_path):
+            rel = os.path.relpath(fs_path, dist_dir).replace(os.sep, "/")
+            # Vite emits content-hashed filenames under /assets/ — cache forever.
+            if rel.startswith("assets/") and re.search(r"-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$", rel):
+                return "public, max-age=31536000, immutable"
+            return "public, max-age=0, must-revalidate"
+
+        def _resolve_static(self, clean_path):
+            """Map a URL path to a file inside dist_dir (npx serve -s semantics).
+
+            Returns (fs_path, spa_fallback); fs_path may be 'REDIRECT:<url>' for
+            directory URLs missing their trailing slash, or None for a 404.
+            Raises PermissionError on any traversal attempt (raw or encoded).
+            """
+            decoded = urllib.parse.unquote(clean_path)
+            rel = decoded.lstrip("/")
+            parts = [p for p in rel.split("/") if p not in ("", ".")]
+            if any(p == ".." for p in parts) or decoded.startswith("/../"):
+                raise PermissionError(decoded)
+            if not parts:
+                return os.path.join(dist_dir, "index.html"), False
+            fs_path = os.path.join(dist_dir, *parts)
+            if os.path.isdir(fs_path):
+                if not clean_path.endswith("/"):
+                    return "REDIRECT:" + decoded + "/", False
+                if os.path.isfile(os.path.join(fs_path, "index.html")):
+                    return os.path.join(fs_path, "index.html"), False
+                return os.path.join(dist_dir, "index.html"), True
+            if os.path.isfile(fs_path):
+                return fs_path, False
+            # serve -s: extension-less paths are SPA routes; missing files that
+            # carry an extension (e.g. hashed assets) are genuine 404s.
+            if "." not in parts[-1]:
+                return os.path.join(dist_dir, "index.html"), True
+            return None, False
+
+        def _serve_static(self, clean_path, include_body=True):
+            try:
+                fs_path, _spa = self._resolve_static(clean_path)
+            except PermissionError:
+                self.send_error(403, "Forbidden")
+                return
+            if fs_path is None:
+                self.send_error(404, "Not Found")
+                return
+            if isinstance(fs_path, str) and fs_path.startswith("REDIRECT:"):
+                self.send_response(301)
+                self.send_header("Location", fs_path[len("REDIRECT:"):])
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+
+            try:
+                st = os.stat(fs_path)
+                with open(fs_path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                self.send_error(404, "Not Found")
+                return
+
+            ctype = mimetypes.guess_type(fs_path)[0] or "application/octet-stream"
+            if ctype.startswith("text/") or ctype in ("application/javascript", "application/json", "image/svg+xml"):
+                ctype += "; charset=utf-8"
+
+            etag = '"%x-%x"' % (st.st_mtime_ns, st.st_size)
+            cache_control = self._cache_control(fs_path)
+
+            # Conditional request -> 304 revalidation (no body by definition)
+            if etag in (self.headers.get("If-None-Match") or ""):
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", cache_control)
+                self.end_headers()
+                return
+
+            range_header = (self.headers.get("Range") or "").strip()
+            can_gzip = (
+                include_body
+                and not range_header
+                and "gzip" in (self.headers.get("Accept-Encoding") or "")
+                and os.path.splitext(fs_path)[1].lower() in self.SERVE_COMPRESSIBLE_EXTS
+                and len(data) > 1024
+            )
+            if can_gzip:
+                data = gzip.compress(data, compresslevel=6)
+
+            common_headers = [
+                ("ETag", etag),
+                ("Cache-Control", cache_control),
+                ("Accept-Ranges", "bytes"),
+                ("X-Content-Type-Options", "nosniff"),
+            ]
+
+            # HTTP Range support (media seeking, resumable downloads). Skipped
+            # when gzipping since ranges must address the on-disk bytes.
+            if range_header and not can_gzip:
+                m = re.match(r"^bytes=(\d*)-(\d*)$", range_header)
+                size = st.st_size
+                if m and (m.group(1) or m.group(2)) and size > 0:
+                    if m.group(1):
+                        start = int(m.group(1))
+                        end = int(m.group(2)) if m.group(2) else size - 1
+                    else:
+                        start = max(0, size - int(m.group(2)))
+                        end = size - 1
+                    if start >= size or start > end:
+                        self.send_response(416)
+                        self.send_header("Content-Range", "bytes */%d" % size)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    end = min(end, size - 1)
+                    chunk = data[start:end + 1]
+                    self.send_response(206)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+                    for k, v in common_headers:
+                        self.send_header(k, v)
+                    self.send_header("Content-Length", str(len(chunk)))
+                    self.end_headers()
+                    if include_body:
+                        self.wfile.write(chunk)
+                    return
+                # Malformed Range header: fall through to a full 200 response.
+
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            for k, v in common_headers:
+                self.send_header(k, v)
+            if can_gzip:
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Vary", "Accept-Encoding")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            if include_body:
+                self.wfile.write(data)
+
+        def do_HEAD(self):
+            clean_path = self.path.split("?")[0]
+            if clean_path.startswith("/api/"):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                return
+            if has_dist:
+                self._serve_static(clean_path, include_body=False)
+                return
+            if clean_path in ("/", "/index.html"):
+                html_bytes = get_standalone_html().encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html_bytes)))
+                self.end_headers()
+            else:
+                self.send_error(404, "Not Found")
 
         def do_GET(self):
             clean_path = self.path.split("?")[0]
@@ -1218,38 +1393,23 @@ def start_web_server(port, env_config, db_path):
                 return
 
             if has_dist:
-                parsed = urlparse(self.path)
-                # Hardened static serving: decode any percent-encoding FIRST, strip
-                # the query string and reject every path-traversal attempt before
-                # touching the filesystem — raw (..%2f) and encoded (%2e%2e) forms
-                # alike, so a request like /..%2f.env can never read outside ./dist.
-                decoded = urllib.parse.unquote(parsed.path)
-                rel = decoded.lstrip("/")
-                parts = [p for p in rel.split("/") if p not in ("", ".")]
-                if any(p == ".." for p in parts) or decoded.startswith("/../"):
-                    self.send_error(403, "Forbidden")
-                    return
-                req_path = os.path.join(dist_dir, *parts) if parts else os.path.join(dist_dir, "index.html")
-                if not os.path.isfile(req_path) and "." not in os.path.basename(rel or "index.html"):
-                    self.path = "/index.html"
-                else:
-                    self.path = "/" + "/".join(parts) if parts else "/index.html"
-                super().do_GET()
-            else:
-                # No compiled dist: serve the built-in dashboard only on the root
-                # path and 404 everything else (never return the page for arbitrary
-                # or traversal-looking paths).
-                if clean_path not in ("/", "/index.html"):
-                    self.send_error(404, "Not Found")
-                    return
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_cors_headers()
-                html = get_standalone_html()
-                html_bytes = html.encode("utf-8")
-                self.send_header("Content-Length", str(len(html_bytes)))
-                self.end_headers()
-                self.wfile.write(html_bytes)
+                self._serve_static(clean_path)
+                return
+
+            # No compiled dist: serve the built-in dashboard only on the root
+            # path and 404 everything else (never return the page for arbitrary
+            # or traversal-looking paths).
+            if clean_path not in ("/", "/index.html"):
+                self.send_error(404, "Not Found")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_cors_headers()
+            html = get_standalone_html()
+            html_bytes = html.encode("utf-8")
+            self.send_header("Content-Length", str(len(html_bytes)))
+            self.end_headers()
+            self.wfile.write(html_bytes)
 
         def do_POST(self):
             clean_path = self.path.split("?")[0]
@@ -1361,11 +1521,11 @@ def start_web_server(port, env_config, db_path):
 
             self._send_json({"ok": False, "message": f"Unknown endpoint: {clean_path}"}, status=404)
 
-    server = HTTPServer(("0.0.0.0", port), CustomHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", port), CustomHandler)
     print(f"{GREEN}{BOLD}⚡ Binance Bot Web Monitor running at:{RESET}")
     print(f"   {CYAN}http://0.0.0.0:{port}{RESET} (Local & VPS IP)")
     if has_dist:
-        print(f"   {DIM}Mode: Serving compiled interactive React Web Dashboard from ./dist{RESET}")
+        print(f"   {DIM}Mode: Serving compiled React dashboard from ./dist (SPA fallback, gzip, ETag/304, Range, keep-alive){RESET}")
     else:
         print(f"   {DIM}Mode: Serving standalone dark-mode monitoring dashboard (Auto-refreshing){RESET}")
     print(f"   {DIM}Press Ctrl+C to stop the web server.{RESET}\n")

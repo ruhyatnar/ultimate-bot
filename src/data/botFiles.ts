@@ -69,7 +69,7 @@ export const BOT_FILES: BotFileDefinition[] = [
     path: 'status.py',
     name: 'status.py',
     category: 'root',
-    description: 'CLI terminal dashboard AND the embedded web monitor: serves /api/status JSON plus the dashboard UI.',
+    description: 'CLI terminal dashboard AND the embedded web monitor: serves /api/status JSON plus the dashboard UI (SPA fallback, gzip, ETag/304, Range, keep-alive — full npx serve parity).',
     enhancements: [
       'Read-only SQLite access (mode:ro, WAL, 10s busy timeout) so it never locks the engine',
       'CORS-enabled /api/status, /api/health and /api/config endpoints for the web dashboard',

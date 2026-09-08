@@ -130,7 +130,7 @@ class SignalGenerator:
         if len(df) < 4: return 0
         # Use last closed candles (df.iloc[-4], -3, -2) to prevent false signals from
         # the unclosed forming candle's fluctuating high/low.
-        c1, c2, c3 = df.iloc[-4], df.iloc[-3], df.iloc[-2]
+        c1, _, c3 = df.iloc[-4], df.iloc[-3], df.iloc[-2]
         threshold = 0.0005 * df['close'].iloc[-1]
         # Bullish FVG: Candle 3's low is strictly higher than Candle 1's high
         if c3['low'] > c1['high'] and (c3['low'] - c1['high']) > threshold: return 1
