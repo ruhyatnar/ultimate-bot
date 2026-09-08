@@ -107,10 +107,22 @@ class WSStreamClient:
                 pass
             self._listen_task = None
         if self.websocket:
+            # Bounded close: a listener cancelled mid-`recv()` can leave the
+            # connection's `connection_lost_waiter` unset, which would otherwise
+            # hang `websocket.close()` forever and wedge the engine's shutdown.
             try:
-                await self.websocket.close()
+                await asyncio.wait_for(self.websocket.close(), timeout=3.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self.logger.warning("WebSocket close timed out during disconnect; aborting connection.")
             except Exception:
                 pass
+            finally:
+                try:
+                    transport = getattr(self.websocket, "transport", None)
+                    if transport is not None:
+                        transport.abort()
+                except Exception:
+                    pass
             self.websocket = None
         self.connected = False
         self._subscribed_symbols.clear()

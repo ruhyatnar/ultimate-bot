@@ -55,7 +55,7 @@ export const DeployGuide: React.FC = () => {
       id: 'step-5',
       title: '6. Start 24/7 Engine with PM2',
       desc: 'Start the bot with PM2 for automated restarts on crashes or server reboots.',
-      cmd: `pm2 start ecosystem.config.js\npm2 save\npm2 startup\n# Stream logs in real-time:\npm2 logs ultimate-bot`
+      cmd: `pm2 start ecosystem.config.cjs\npm2 save\npm2 startup\n# Stream logs in real-time:\npm2 logs ultimate-bot`
     },
     {
       id: 'step-6',
@@ -73,7 +73,7 @@ export const DeployGuide: React.FC = () => {
       id: 'step-8',
       title: '9. Monitor Mode C: Web Dashboard & Remote Browser UI',
       desc: 'Access your live dashboard from any browser using the built-in Python web server, PM2, or static React server.',
-      cmd: `# Choice 1: Instant Python Web Monitor (Zero npm/Node build required):\npython3 status.py --web 3000\n\n# Choice 2: Automated 24/7 PM2 Supervision (Runs bot + web monitor together):\npm2 start ecosystem.config.js\npm2 save\n\n# Choice 3: Pre-built React Production Dashboard (inside ultimate-bot/):\nnpx serve -s dist -l 3000\n\n# Remote Access: Visit http://YOUR_VPS_IP:3000 in your browser\n# Or SSH Port Tunnel (run on your local PC): ssh -L 3000:localhost:3000 user@YOUR_VPS_IP`
+      cmd: `# Choice 1: Instant Python Web Monitor (Zero npm/Node build required):\npython3 status.py --web 3000\n\n# Choice 2: Automated 24/7 PM2 Supervision (Runs bot + web monitor together):\npm2 start ecosystem.config.cjs\npm2 save\n\n# Choice 3: Pre-built React Production Dashboard (inside ultimate-bot/):\nnpx serve -s dist -l 3000\n\n# Remote Access: Visit http://YOUR_VPS_IP:3000 in your browser\n# Or SSH Port Tunnel (run on your local PC): ssh -L 3000:localhost:3000 user@YOUR_VPS_IP`
     }
   ];
 

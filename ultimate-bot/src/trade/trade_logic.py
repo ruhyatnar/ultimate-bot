@@ -727,10 +727,13 @@ class TradeLogic:
 
     async def _send_daily_report(self):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        row = await self.db.fetch_one("SELECT COUNT(*), SUM(profit_loss) FROM orders WHERE status='FILLED' AND side='SELL' AND date(created_at/1000, 'unixepoch') = ?", (today,))
+        # "Closed trades" uses the same definition as the web monitor stats: SELL exit
+        # orders that recorded a realized PnL, including partial-exit legs (CANCELED
+        # SELL orders with profit_loss set). BUY entries are never counted.
+        row = await self.db.fetch_one("SELECT COUNT(*), SUM(profit_loss) FROM orders WHERE side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss IS NOT NULL AND date(created_at/1000, 'unixepoch') = ?", (today,))
         total_trades = row[0] if row else 0
         total_pnl = row[1] if row and row[1] is not None else 0.0
-        row = await self.db.fetch_one("SELECT COUNT(*) FROM orders WHERE status='FILLED' AND side='SELL' AND profit_loss > 0 AND date(created_at/1000, 'unixepoch') = ?", (today,))
+        row = await self.db.fetch_one("SELECT COUNT(*) FROM orders WHERE side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss > 0 AND date(created_at/1000, 'unixepoch') = ?", (today,))
         wins = row[0] if row else 0
         win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
         embed = {

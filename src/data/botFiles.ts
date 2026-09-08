@@ -8,7 +8,7 @@ import ENV_EXAMPLE from '../../ultimate-bot/.env.example?raw';
 import CONFIG_PY from '../../ultimate-bot/config.py?raw';
 import MAIN_PY from '../../ultimate-bot/main.py?raw';
 import STATUS_PY from '../../ultimate-bot/status.py?raw';
-import ECOSYSTEM_JS from '../../ultimate-bot/ecosystem.config.js?raw';
+import ECOSYSTEM_JS from '../../ultimate-bot/ecosystem.config.cjs?raw';
 import REQUIREMENTS_TXT from '../../ultimate-bot/requirements.txt?raw';
 import INIT_PY_RAW from '../../ultimate-bot/src/__init__.py?raw';
 import BACKOFF_PY from '../../ultimate-bot/src/core/backoff.py?raw';
@@ -79,8 +79,8 @@ export const BOT_FILES: BotFileDefinition[] = [
     content: STATUS_PY,
   },
   {
-    path: 'ecosystem.config.js',
-    name: 'ecosystem.config.js',
+    path: 'ecosystem.config.cjs',
+    name: 'ecosystem.config.cjs',
     category: 'root',
     description: 'PM2 production process supervisor config: auto-restart, memory cap, log routing.',
     enhancements: [

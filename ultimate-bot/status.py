@@ -68,6 +68,13 @@ def load_env(env_path=None):
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
                     config[k.strip()] = v.strip()
+    # Environment variables override the file for keys it defines — matching the
+    # engine's python-dotenv behavior — so operators can point the web monitor at
+    # a different DB/log/control path (e.g. DB_PATH=/tmp/x status.py --web) without
+    # editing .env.
+    for key, value in os.environ.items():
+        if key in config and value:
+            config[key] = value
     return config
 
 
@@ -234,25 +241,58 @@ def read_database(db_path):
         ).fetchall()
         orders = [dict(row) for row in orders_rows]
 
-        # Aggregate trade statistics
+        # Aggregate trade statistics.
+        # "Closed trades" = SELL exit orders that recorded a realized PnL. This is
+        # exactly how the engine finalizes exits (close_trade sets profit_loss on the
+        # SELL order and marks it FILLED), including partial-exit legs which are
+        # persisted as CANCELED SELL orders with a non-zero profit_loss. BUY entries,
+        # NEW orders and CANCELED attempts (profit_loss NULL) are excluded so the
+        # win/loss denominator can never be diluted by non-exits.
         stats_row = cur.execute(
             "SELECT COUNT(*) as total_orders, "
-            "SUM(CASE WHEN side='SELL' AND status='FILLED' THEN 1 ELSE 0 END) as closed_trades, "
-            "SUM(CASE WHEN side='SELL' AND status='FILLED' AND profit_loss > 0 THEN 1 ELSE 0 END) as winning_trades, "
-            "SUM(CASE WHEN side='SELL' AND status='FILLED' AND profit_loss < 0 THEN 1 ELSE 0 END) as losing_trades, "
-            "SUM(CASE WHEN status='FILLED' THEN profit_loss ELSE 0 END) as total_pnl "
+            "SUM(CASE WHEN side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss IS NOT NULL THEN 1 ELSE 0 END) as closed_trades, "
+            "SUM(CASE WHEN side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss > 0 THEN 1 ELSE 0 END) as winning_trades, "
+            "SUM(CASE WHEN side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss < 0 THEN 1 ELSE 0 END) as losing_trades, "
+            "SUM(CASE WHEN status IN ('FILLED','CANCELED') AND profit_loss IS NOT NULL THEN profit_loss ELSE 0 END) as total_pnl "
             "FROM orders"
         ).fetchone()
 
+        closed_trades = int(stats_row["closed_trades"] or 0) if stats_row else 0
+        winning_trades = int(stats_row["winning_trades"] or 0) if stats_row else 0
+        losing_trades = int(stats_row["losing_trades"] or 0) if stats_row else 0
+        breakeven_trades = max(0, closed_trades - winning_trades - losing_trades)
+        total_pnl = float(stats_row["total_pnl"] or 0.0) if stats_row else 0.0
+        win_rate = round(winning_trades / closed_trades * 100, 1) if closed_trades > 0 else 0.0
+        avg_win = 0.0
+        if winning_trades > 0:
+            # Average of winning trades' PnL only (NOT total_pnl, which includes losses)
+            win_row = cur.execute(
+                "SELECT SUM(profit_loss) FROM orders WHERE side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss > 0"
+            ).fetchone()
+            avg_win = float(win_row[0] or 0.0) / winning_trades if win_row and win_row[0] else 0.0
+        avg_loss = 0.0
+        if losing_trades > 0:
+            # Sum of losing PnL only (avg_loss shown as a positive magnitude)
+            loss_row = cur.execute(
+                "SELECT SUM(profit_loss) FROM orders WHERE side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss < 0"
+            ).fetchone()
+            avg_loss = abs(float(loss_row[0] or 0.0)) / losing_trades if loss_row and loss_row[0] else 0.0
+        profit_factor = (avg_win * winning_trades) / (avg_loss * losing_trades) if (avg_loss * losing_trades) > 0 else (0.0 if total_pnl <= 0 else float('inf'))
+
         stats = {
-            "total_orders": stats_row["total_orders"] if stats_row else 0,
-            "closed_trades": stats_row["closed_trades"] if stats_row and stats_row["closed_trades"] else 0,
-            "winning_trades": stats_row["winning_trades"] if stats_row and stats_row["winning_trades"] else 0,
-            "losing_trades": stats_row["losing_trades"] if stats_row and stats_row["losing_trades"] else 0,
-            "total_realized_pnl": float(stats_row["total_pnl"] or 0.0) if stats_row else 0.0,
-            "win_rate": round(
-                (float(stats_row["winning_trades"] or 0) / float(stats_row["closed_trades"] or 1) * 100), 1
-            ) if stats_row and (stats_row["closed_trades"] or 0) > 0 else 0.0
+            "total_orders": int(stats_row["total_orders"] or 0) if stats_row else 0,
+            "closed_trades": closed_trades,
+            "winning_trades": winning_trades,
+            "losing_trades": losing_trades,
+            "breakeven_trades": breakeven_trades,
+            "total_realized_pnl": round(total_pnl, 2),
+            "win_rate": win_rate,
+            "profit_factor": round(profit_factor, 2) if profit_factor != float('inf') else None,
+            "avg_win": round(avg_win, 2),
+            "avg_loss": round(avg_loss, 2),
+            "win_streak": risk.get("win_streak", "0"),
+            "loss_streak": risk.get("loss_streak", "0"),
+            "daily_pnl": float(risk.get("daily_pnl") or 0.0)
         }
 
         conn.close()
@@ -650,7 +690,16 @@ def render_dashboard(env_config, db_path):
     win_rate = stats.get("win_rate", 0.0)
 
     output.append(f"\n{BOLD} 🛡️ RISK METRICS & PERFORMANCE STATS{RESET}")
-    output.append(f"  Win Rate       : {BOLD}{win_rate:.1f}%{RESET} ({stats.get('winning_trades', 0)} wins / {stats.get('closed_trades', 0)} closed trades)")
+    closed_cnt = stats.get('closed_trades', 0)
+    win_cnt = stats.get('winning_trades', 0)
+    loss_cnt = stats.get('losing_trades', 0)
+    be_cnt = stats.get('breakeven_trades', 0)
+    pf = stats.get('profit_factor')
+    pf_str = f"{pf:.2f}" if isinstance(pf, (int, float)) else "∞"
+    avg_win = stats.get('avg_win', 0.0)
+    avg_loss = stats.get('avg_loss', 0.0)
+    output.append(f"  Win Rate       : {BOLD}{win_rate:.1f}%{RESET} ({win_cnt}W / {loss_cnt}L / {be_cnt}B / {closed_cnt} closed)")
+    output.append(f"  Profit Factor  : {BOLD}{pf_str}{RESET}    Avg Win: {GREEN}${avg_win:,.2f}{RESET}    Avg Loss: {RED}-${avg_loss:,.2f}{RESET}")
     output.append(f"  Streak Monitor : Win Streak: {GREEN}{win_streak}{RESET}/{env_config.get('MAX_WIN_STREAK', '5')}    Loss Streak: {RED}{loss_streak}{RESET}/{env_config.get('MAX_LOSS_STREAK', '3')}")
     output.append(f"  Total Realized : {GREEN if stats.get('total_realized_pnl', 0)>=0 else RED}${stats.get('total_realized_pnl', 0):+,.2f} {quote}{RESET}    Daily DD Limit : {max_dd:.1f}%")
 
@@ -802,6 +851,30 @@ def get_standalone_html():
       </div>
     </div>
 
+    <!-- Performance & Risk Statistics -->
+    <div class="grid">
+      <div class="card">
+        <div class="card-title">🎯 Win Rate</div>
+        <div id="perfWinRate" class="card-value">—</div>
+        <div id="perfWinRateSub" class="card-sub">Closed trades: —</div>
+      </div>
+      <div class="card">
+        <div class="card-title">⚖️ Profit Factor</div>
+        <div id="perfProfitFactor" class="card-value">—</div>
+        <div class="card-sub">Gross wins ÷ gross losses</div>
+      </div>
+      <div class="card">
+        <div class="card-title">💵 Total Realized PnL</div>
+        <div id="perfTotalPnl" class="card-value">—</div>
+        <div id="perfTotalPnlSub" class="card-sub">Avg Win: — / Avg Loss: —</div>
+      </div>
+      <div class="card">
+        <div class="card-title">🔥 Win / Loss Streaks</div>
+        <div id="perfStreaks" class="card-value">—</div>
+        <div class="card-sub">Cooldown monitor (MAX_WIN_STREAK / MAX_LOSS_STREAK)</div>
+      </div>
+    </div>
+
     <!-- Non-Zero Assets Breakdown -->
     <div class="card" style="margin-bottom: 24px;" id="assetsContainer">
       <div class="card-title">Account Non-Zero Assets Breakdown</div>
@@ -882,7 +955,33 @@ def get_standalone_html():
         pnlEl.className = 'card-value ' + (pnlVal >= 0 ? 'pnl-pos' : 'pnl-neg');
 
         const stats = data.data?.stats || {};
-        document.getElementById('pnlSub').innerText = 'Win Rate: ' + (stats.win_rate || 0) + '% (' + (stats.winning_trades || 0) + ' wins)';
+        const wins = stats.winning_trades || 0;
+        const losses = stats.losing_trades || 0;
+        const breakevens = stats.breakeven_trades || 0;
+        const closedCount = stats.closed_trades || 0;
+        document.getElementById('pnlSub').innerText = 'Win Rate: ' + (stats.win_rate || 0) + '% (' + wins + 'W / ' + losses + 'L / ' + breakevens + 'B)';
+
+        // Performance & Risk statistics (win rate / profit factor / realized PnL / streaks)
+        const perfWinRate = document.getElementById('perfWinRate');
+        const wrVal = stats.win_rate || 0;
+        perfWinRate.innerText = wrVal.toFixed ? wrVal.toFixed(1) + '%' : (wrVal + '%');
+        perfWinRate.className = 'card-value ' + (wrVal >= 50 ? 'pnl-pos' : 'pnl-neg');
+        document.getElementById('perfWinRateSub').innerText = closedCount + ' closed (' + wins + 'W / ' + losses + 'L / ' + breakevens + 'B) — Win Rate = wins ÷ closed';
+
+        const pfVal = stats.profit_factor;
+        document.getElementById('perfProfitFactor').innerText = (pfVal === null || pfVal === undefined) ? '∞' : pfVal.toFixed(2);
+        document.getElementById('perfProfitFactor').className = 'card-value ' + ((pfVal !== null && pfVal !== undefined && pfVal >= 1) ? 'pnl-pos' : 'pnl-neg');
+
+        const totalPnl = parseFloat(stats.total_realized_pnl || 0);
+        const perfPnlEl = document.getElementById('perfTotalPnl');
+        perfPnlEl.innerText = (totalPnl >= 0 ? '+' : '') + '$' + totalPnl.toFixed(2);
+        perfPnlEl.className = 'card-value ' + (totalPnl >= 0 ? 'pnl-pos' : 'pnl-neg');
+        document.getElementById('perfTotalPnlSub').innerText = 'Avg Win: $' + (stats.avg_win || 0).toFixed(2) + ' / Avg Loss: -$' + (stats.avg_loss || 0).toFixed(2);
+
+        const riskState = data.data?.risk || {};
+        const winStr = riskState.win_streak !== undefined ? String(riskState.win_streak) : '0';
+        const lossStr = riskState.loss_streak !== undefined ? String(riskState.loss_streak) : '0';
+        document.getElementById('perfStreaks').innerText = winStr + 'W / ' + lossStr + 'L';
 
         // Strategy preset
         document.getElementById('strategyPreset').innerText = (data.config.PRESET || 'DAY').toUpperCase();
@@ -1119,11 +1218,30 @@ def start_web_server(port, env_config, db_path):
                 return
 
             if has_dist:
-                req_path = os.path.join(dist_dir, self.path.lstrip("/"))
-                if not os.path.exists(req_path) and "." not in os.path.basename(self.path):
+                parsed = urlparse(self.path)
+                # Hardened static serving: decode any percent-encoding FIRST, strip
+                # the query string and reject every path-traversal attempt before
+                # touching the filesystem — raw (..%2f) and encoded (%2e%2e) forms
+                # alike, so a request like /..%2f.env can never read outside ./dist.
+                decoded = urllib.parse.unquote(parsed.path)
+                rel = decoded.lstrip("/")
+                parts = [p for p in rel.split("/") if p not in ("", ".")]
+                if any(p == ".." for p in parts) or decoded.startswith("/../"):
+                    self.send_error(403, "Forbidden")
+                    return
+                req_path = os.path.join(dist_dir, *parts) if parts else os.path.join(dist_dir, "index.html")
+                if not os.path.isfile(req_path) and "." not in os.path.basename(rel or "index.html"):
                     self.path = "/index.html"
+                else:
+                    self.path = "/" + "/".join(parts) if parts else "/index.html"
                 super().do_GET()
             else:
+                # No compiled dist: serve the built-in dashboard only on the root
+                # path and 404 everything else (never return the page for arbitrary
+                # or traversal-looking paths).
+                if clean_path not in ("/", "/index.html"):
+                    self.send_error(404, "Not Found")
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_cors_headers()

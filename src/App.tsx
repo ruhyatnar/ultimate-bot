@@ -486,9 +486,24 @@ export default function App() {
         setActiveTrades(mappedActive);
       }
 
-      // Sync recent orders from SQLite
+      // Sync recent COMPLETED trades from SQLite.
+      // CRITICAL: only SELL exit orders that actually recorded a realized PnL are
+      // mapped into closedTrades. The raw orders list also contains BUY entry
+      // orders (profit_loss=0), NEW orders, and CANCELED attempts — including any
+      // of those would dilute the win-rate denominator (the engine's stats count
+      // wins/losses over closed SELL exits only). Partial-exit legs are persisted
+      // as CANCELED SELL orders with a non-zero profit_loss, so they are included.
       if (Array.isArray(json.data?.orders)) {
-        const mappedOrders: ClosedTrade[] = json.data.orders.map((o: any) => {
+        const exitOrders = json.data.orders.filter((o: any) => {
+          const side = String(o.side || '').toUpperCase();
+          const status = String(o.status || '').toUpperCase();
+          if (side !== 'SELL') return false;
+          const hasPnl = o.profit_loss !== null && o.profit_loss !== undefined;
+          if (status === 'FILLED') return true;
+          if (status === 'CANCELED') return hasPnl && parseFloat(o.profit_loss) !== 0;
+          return false;
+        });
+        const mappedOrders: ClosedTrade[] = exitOrders.map((o: any) => {
           const entryP = parseFloat(o.price || o.avg_fill_price || 0);
           const exitP = parseFloat(o.avg_fill_price || o.price || 0);
           const q = parseFloat(o.executed_qty || o.quantity || 0);
@@ -507,7 +522,7 @@ export default function App() {
           return {
             id: `order_${o.order_id}`,
             symbol: o.symbol,
-            side: (o.side || 'BUY') as 'BUY' | 'SELL',
+            side: (o.side || 'SELL') as 'BUY' | 'SELL',
             entryPrice: entryP,
             exitPrice: exitP,
             quantity: q,
@@ -515,7 +530,9 @@ export default function App() {
             pnlPct,
             entryTime: parseTs(o.created_at, Date.now() - 3600000),
             exitTime: parseTs(o.updated_at, Date.now()),
-            exitReason: (o.status || 'FILLED') as any
+            // The engine does not persist the exit reason in the orders table, so
+            // map the order status to a readable label instead of showing 'FILLED'.
+            exitReason: (String(o.status || '').toUpperCase() === 'CANCELED' ? 'PARTIAL_EXIT' : 'MARKET_EXIT') as any
           };
         });
         if (mappedOrders.length > 0) {
@@ -1056,7 +1073,13 @@ export default function App() {
       });
     }
 
-    setCandidates(evaluatedCandidates);
+    // In VPS mode the real engine-scanned candidates arrive via /api/status
+    // (fetchVpsData) — never overwrite them with locally-simulated candidates,
+    // otherwise the screener would show fake momentum rankings instead of the
+    // engine's actual scanned pool.
+    if (curDataSource !== 'vps') {
+      setCandidates(evaluatedCandidates);
+    }
 
     // Determine which symbols are actively monitored by the trading engine
     const openTradeSymbols = curActiveTrades.map(t => t.symbol);
@@ -1350,6 +1373,7 @@ export default function App() {
             vpsPushResult={vpsPushResult}
             controlPaused={vpsControl.paused}
             onToggleVpsPause={handleToggleVpsPause}
+            serverStats={vpsStatus.stats || null}
           />
         )}
 

@@ -7,7 +7,7 @@ A production-grade **Binance Spot** trading engine with **market-only execution*
 │   ├── main.py            # Async engine entrypoint (signal loop, exits, reconciliation)
 │   ├── status.py          # CLI dashboard + embedded web monitor / control API
 │   ├── config.py          # .env loader, presets, boot-time validation
-│   ├── ecosystem.config.js# PM2: runs engine AND web monitor
+│   ├── ecosystem.config.cjs# PM2: runs engine AND web monitor
 │   ├── .env.example       # Annotated template for every config key
 │   └── src/               # exchange / strategy / risk / trade / database / reporting modules
 ├── src/                   # React + Vite web dashboard (Strategy Simulator + VPS ops center)
@@ -15,6 +15,18 @@ A production-grade **Binance Spot** trading engine with **market-only execution*
 ```
 
 Full documentation and step-by-step Debian 13 VPS instructions live in **[ultimate-bot/README.md](./ultimate-bot/README.md)**.
+
+> **Smoke test**: `npm run smoke` (or `ultimate-bot/venv/bin/python3 ultimate-bot/smoke_test.py`) boots the engine against an isolated temp DB and verifies boot, single-instance locking, second-instance rejection, web-monitor stats consistency, and clean SIGTERM shutdown — all without touching your real `trading.db`.
+
+### Recent correctness & safety fixes
+
+- **Win/loss & win-rate accounting** — the dashboard previously counted every recent order (including BUY entries with zero PnL) as a "closed trade", diluting the win rate. Closed trades are now derived from SELL exit orders only, and the VPS dashboard prefers the engine's full-history aggregates, so displayed wins/losses always match the win rate.
+- **Partial-exit PnL counted** — partial-exit legs (persisted as `CANCELED` SELL orders with a realized PnL) are now included in the monitor's stats, the CLI dashboard, the daily Discord report and the web UI, matching the engine's own streak/cooldown accounting.
+- **Live-mode startup crash fixed** — the WebSocket API client was missing `import os`, raising `NameError` at boot whenever an Ed25519 private key was configured for live trading.
+- **Web monitor hardening** — percent-encoded path-traversal attempts (`..%2f`, `%2e%2e`) are rejected before any file is read; unknown paths return 404 instead of serving the dashboard HTML.
+- **Live screener integrity** — the React dashboard no longer overwrites the engine-scanned candidates with locally simulated momentum rankings while synced to a VPS.
+- **Credential-safe VPS sync** — the 1-click SSH `.env` sync now backs up the existing `.env` first and warns that credentials must be preserved (the browser push path already applies a whitelist that never touches credentials).
+- **Graceful shutdown hang fixed** — the engine previously hung forever on SIGINT/SIGTERM (the signal handler cancelled `main()` mid-cleanup and stopped the loop, leaving a torn-down WebSocket awaited indefinitely), which wedged `pm2 reload/restart` and kept the single-instance lock held. Signals now only flag a shutdown event; `main()` stops the loops, cancels background tasks, and tears down connections with bounded timeouts (verified live: clean exit in ~5s, lock released).
 
 ---
 
@@ -43,7 +55,7 @@ cp .env.example .env
 nano .env
 
 # 5. Launch engine + web monitor under PM2 supervision
-pm2 start ecosystem.config.js
+pm2 start ecosystem.config.cjs
 pm2 save
 
 # 6. Monitor in real time
@@ -58,6 +70,8 @@ pm2 save
 Run the React dashboard (`npm run dev`, or serve the compiled `dist/` next to `status.py`), then:
 
 - **Live VPS Bot Sync**: point the dashboard at your VPS (`http://IP:3000`) to stream the real engine state from SQLite — active positions, orders, equity, daily PnL, win/loss streaks, scanned candidates, and the engine's own log file. No fake local balances are shown for the live server.
+- **Engine-Exact Performance Stats**: in VPS mode the Performance card uses the engine's own SQLite aggregates — win rate, wins/losses/breakevens, profit factor, average win/loss, total realized PnL and streaks — instead of recomputing from a short window of recent orders. Only SELL exit orders with realized PnL are ever counted as closed trades, so the win/loss numbers always match the engine's win rate.
+- **Comprehensive `status.py` Fallback Dashboard**: when no compiled `dist/` is present, `status.py --web` serves an upgraded standalone dashboard with a full performance section (win rate with W/L/B breakdown, profit factor, total realized PnL, average win/loss, and streak monitor) in addition to balance, scanner, positions and orders.
 - **Tune Strategy Parameters**: live sliders/presets for Confluence Threshold (1–5), ATR multipliers, trailing-stop levels, capital allocation, scan interval, and max positions.
 - **Dynamic Momentum Screener**: ranked candidates via the 4-factor Z-score (Volume, 24h Change, Volatility, ADX) with a correlation penalty — pin or deselect symbols from the trading basket.
 - **Symbol Deep-Dive**: inspect all 5 Smart Money confluence factors for any token, plus an order-size calculator with `MIN_NOTIONAL` validation and instant simulated buys.
@@ -77,6 +91,6 @@ A **Strategy Simulator** sandbox (forward-tested paper trading with fee-accurate
 - Net PnL always deducts 0.1% taker fees per leg; fee-aware breakeven lock at entry +0.25%.
 - Daily drawdown circuit breaker, per-symbol win/loss streak cooldowns, exchange position reconciliation, and single-instance locking.
 - WAL-mode SQLite with a batched async write queue and read-only monitor access.
-- PM2 supervision of both the engine and the web monitor (`ecosystem.config.js`).
+- PM2 supervision of both the engine and the web monitor (`ecosystem.config.cjs`).
 
 For technical indicator definitions, full `.env` reference, presets, and the live-readiness checklist, see **[ultimate-bot/README.md](./ultimate-bot/README.md)**.

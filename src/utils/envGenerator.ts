@@ -29,6 +29,10 @@ PAPER_TRADE=${config.paperTrade}
 USE_TESTNET=${config.useTestnet}
 
 # --- Binance Credentials ---
+# ⚠️ Placeholders below are for NEW setups only. If you are pushing this over an
+# EXISTING VPS deployment, preserve your current BINANCE_API_KEY / BINANCE_API_SECRET
+# (the web monitor's POST /api/config whitelist never touches credentials, and the
+# engine requires the real key to boot in live mode).
 BINANCE_API_KEY=${apiKey}
 BINANCE_PRIVATE_KEY_PATH=./keys/private_key.pem
 

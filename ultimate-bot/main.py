@@ -32,15 +32,20 @@ except BlockingIOError:
 
 shutdown_event = asyncio.Event()
 
-async def shutdown(sig, loop):
+
+def request_shutdown(sig):
+    """Signal entry point: only flag the shutdown event.
+
+    Deliberately does NOT cancel tasks or stop the loop here. Cancelling tasks
+    from the signal handler races with main()'s own cleanup (it previously
+    cancelled main() itself mid-`finally`, then called loop.stop(), leaving
+    ws_stream.disconnect() hung on a torn-down websocket forever — PM2 reloads
+    would hang and the lock would never be released). main() observes the event,
+    stops the trading loop, cancels background tasks itself, and then tears down
+    connections/database in dependency order.
+    """
     logging.getLogger(__name__).info(f"Received signal {sig}, shutting down...")
     shutdown_event.set()
-    await asyncio.sleep(2)
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    for task in tasks:
-        task.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
-    loop.stop()
 
 async def main():
     setup_logging(config)
@@ -123,20 +128,30 @@ async def main():
     except Exception as e:
         await error_handler.handle(e, "main_loop")
     finally:
+        # 1. Stop the engine loops first so no new work is enqueued.
+        for task in background_tasks:
+            task.cancel()
+        await asyncio.gather(*background_tasks, return_exceptions=True)
+        # 2. Tear down connections and the database in dependency order.
         if ws_api:
             await ws_api.disconnect()
         await ws_stream.disconnect()
         await db.close()
         await rest.close()
         await webhook.close()
+        # 3. Release the single-instance lock LAST, only once cleanup finished.
         fcntl.flock(lock_file, fcntl.LOCK_UN)
         lock_file.close()
+        logger.info("Shutdown complete.")
 
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    # Signal handlers only flag the shutdown event (see request_shutdown) — they
+    # never cancel tasks or stop the loop themselves, so a SIGTERM/SIGINT cannot
+    # hang or leave the engine half-torn-down.
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s, loop)))
+        loop.add_signal_handler(sig, request_shutdown, sig)
     try:
         loop.run_until_complete(main())
     finally:

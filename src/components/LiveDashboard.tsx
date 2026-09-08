@@ -20,7 +20,8 @@ import {
   StrategyPreset,
   CandidateSymbol,
   PushResult,
-  VpsBalanceData
+  VpsBalanceData,
+  VpsBotStatus
 } from '../types';
 import { TuningControlBar } from './TuningControlBar';
 import { DynamicScreener } from './DynamicScreener';
@@ -57,6 +58,7 @@ interface LiveDashboardProps {
   vpsPushResult?: PushResult | null;
   controlPaused?: boolean;
   onToggleVpsPause?: () => void;
+  serverStats?: VpsBotStatus['stats'] | null;
 }
 
 const formatPrice = (val: number): string => {
@@ -107,7 +109,8 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
   onPushConfigToVps,
   vpsPushResult = null,
   controlPaused = false,
-  onToggleVpsPause
+  onToggleVpsPause,
+  serverStats = null
 }) => {
   const [inspectedSymbol, setInspectedSymbol] = useState<string | null>(null);
   const [showVpsSync, setShowVpsSync] = useState<boolean>(false);
@@ -117,14 +120,28 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
   const drawdownLimit = config.maxDailyDrawdown;
   const drawdownPct = Math.min(100, (drawdownUsed / drawdownLimit) * 100);
 
-  const winningTrades = closedTrades.filter(t => t.pnl > 0);
-  const winRate = closedTrades.length > 0 
-    ? (winningTrades.length / closedTrades.length) * 100 
-    : 0;
+  // In VPS mode prefer the engine's authoritative stats (aggregated over the full
+  // SQLite history) over the locally-mapped window of recent orders, so win rate,
+  // profit factor and win/loss counts always match the engine exactly.
+  const useServerStats = dataSource === 'vps' && !!serverStats && (serverStats.closed_trades ?? 0) > 0;
 
-  const grossProfit = winningTrades.reduce((acc, t) => acc + t.pnl, 0);
-  const grossLoss = Math.abs(closedTrades.filter(t => t.pnl < 0).reduce((acc, t) => acc + t.pnl, 0));
-  const profitFactor = grossLoss > 0 ? (grossProfit / grossLoss).toFixed(2) : grossProfit > 0 ? 'MAX' : '0.00';
+  const winningTrades = closedTrades.filter(t => t.pnl > 0);
+  const losingTrades = closedTrades.filter(t => t.pnl < 0);
+  const winRate = useServerStats
+    ? (serverStats!.win_rate ?? 0)
+    : closedTrades.length > 0
+      ? (winningTrades.length / closedTrades.length) * 100
+      : 0;
+
+  const grossProfit = useServerStats
+    ? (serverStats!.avg_win ?? 0) * (serverStats!.winning_trades ?? 0)
+    : winningTrades.reduce((acc, t) => acc + t.pnl, 0);
+  const grossLoss = useServerStats
+    ? Math.abs((serverStats!.avg_loss ?? 0) * (serverStats!.losing_trades ?? 0))
+    : Math.abs(losingTrades.reduce((acc, t) => acc + t.pnl, 0));
+  const profitFactor = grossLoss > 0
+    ? (grossProfit / grossLoss).toFixed(2)
+    : grossProfit > 0 ? 'MAX' : '0.00';
 
   const inspectedData = inspectedSymbol 
     ? symbolsData.find(s => s.symbol === inspectedSymbol) || {
@@ -299,6 +316,27 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
             <span>Win Streak: <b className="text-emerald-400">{winStreak}</b>/{config.maxWinStreak}</span>
             <span>Loss Streak: <b className="text-rose-400">{lossStreak}</b>/{config.maxLossStreak}</span>
           </div>
+          {useServerStats ? (
+            <div className="mt-2 pt-2 border-t border-slate-700/50 text-[11px] text-slate-400 flex items-center justify-between">
+              <span>
+                <b className="text-emerald-400">{serverStats!.winning_trades ?? 0}W</b> /{' '}
+                <b className="text-rose-400">{serverStats!.losing_trades ?? 0}L</b> /{' '}
+                <b className="text-slate-300">{serverStats!.breakeven_trades ?? 0}B</b> •{' '}
+                <b className="text-slate-200">{serverStats!.closed_trades ?? 0}</b> closed
+              </span>
+              <span>Avg W <b className="text-emerald-400">${(serverStats!.avg_win ?? 0).toFixed(2)}</b> / L <b className="text-rose-400">${(serverStats!.avg_loss ?? 0).toFixed(2)}</b></span>
+            </div>
+          ) : (
+            <div className="mt-2 pt-2 border-t border-slate-700/50 text-[11px] text-slate-400 flex items-center justify-between">
+              <span>
+                <b className="text-emerald-400">{winningTrades.length}W</b> /{' '}
+                <b className="text-rose-400">{losingTrades.length}L</b> /{' '}
+                <b className="text-slate-300">{closedTrades.length - winningTrades.length - losingTrades.length}B</b> •{' '}
+                <b className="text-slate-200">{closedTrades.length}</b> closed
+              </span>
+              <span>Total Realized <b className="text-slate-200">${closedTrades.reduce((a, t) => a + t.pnl, 0).toFixed(2)}</b></span>
+            </div>
+          )}
         </div>
       </div>
 

@@ -31,7 +31,7 @@ Engineered for **Debian 13 (Trixie) CLI-only VPS** environments with zero GUI ov
 - **Multi-Stream WebSockets**: Public market-data WebSocket streaming for real-time tick prices (aggTrade + kline bars) with automatic REST fallback, plus the authenticated Binance WebSocket API v3 for low-latency order routing.
 - **SQLite State Machine**: ACID-compliant persistence (`data/trading.db`) with **WAL mode**, a **dedicated read-only connection** for the monitor, and an **asynchronous batched write queue** that eliminates `database is locked` errors.
 - **Debian 13 & PEP 668 Native**: Runs inside an isolated Python virtual environment (`python3-venv`), never polluting system packages.
-- **PM2 Process Supervision**: `ecosystem.config.js` supervises **both** the engine (`main.py`) and the web monitor (`status.py --web 3000`) with auto-restart, a 2 GB memory cap, and rotating log files.
+- **PM2 Process Supervision**: `ecosystem.config.cjs` supervises **both** the engine (`main.py`) and the web monitor (`status.py --web 3000`) with auto-restart, a 2 GB memory cap, and rotating log files. (`.cjs` — the repo's root `package.json` sets `"type": "module"`, which would otherwise break `pm2 start` on CommonJS configs.)
 - **Unified Terminal & Web Monitor**: `status.py` serves an `htop`-style terminal dashboard **and** an embedded HTTP API (`/api/status`, `/api/logs`, `/api/health`, `/api/config`, `/api/control`) used by the interactive React web dashboard.
 - **Remote Operation**: The web dashboard can pause new entries, resume, liquidate all positions, close a single symbol, and push tuned `.env` parameters — no SSH required.
 - **Config Boot Validation**: `config.py` validates every tunable key at startup (ranges, non-negativity, integer minimums) so a typo in `.env` fails fast with a clear message instead of producing silent bad behavior.
@@ -98,6 +98,14 @@ All realized PnL is **net of 0.1% taker fees on both legs** (0.2% round-trip) so
 9. **8-Decimal Quantization & Formatting (FIXED)** — order quantity string generation now formats up to 8 decimal places (`.8f`), preventing truncation or scientific notation rejections on high-precision / low-price crypto assets (e.g. BTC, SHIB, PEPE).
 10. **High-Volatility Slippage Parameter Range (FIXED)** — `MAX_SLIPPAGE_PERCENT` validator expanded from `(0, 1]` to `(0, 10.0]`, allowing traders to set custom slippage thresholds for fast-moving pairs without boot-time errors.
 11. **Directory-Agnostic Environment Discovery (FIXED)** — `status.py` dynamically locates `.env` regardless of whether invoked from the project root or the `ultimate-bot/` directory.
+12. **Win/Loss & Win-Rate Accounting (FIXED)** — the web dashboard previously mapped every recent order (including BUY entry orders with zero PnL, NEW orders and CANCELED attempts) into "closed trades", which diluted the win rate. Closed trades are now derived from **SELL exit orders only** (FILLED, plus CANCELED partial-exit legs that recorded a realized PnL), and the VPS dashboard prefers the engine's full-history aggregates (`win_rate`, `profit_factor`, `avg_win`, `avg_loss`, `breakeven_trades`) — so wins + losses + breakevens always reconcile with the displayed win rate.
+13. **Partial-Exit PnL Missing from Stats (FIXED)** — partial-exit legs are persisted as `CANCELED` SELL orders with a realized PnL, but the monitor's stats and the daily Discord report only counted `FILLED` exits. Both now include `status IN ('FILLED','CANCELED') AND profit_loss IS NOT NULL`, matching the engine's own streak/cooldown accounting in `update_trade_result`.
+14. **Live-Mode Startup Crash in `ws_api_client.py` (FIXED)** — the WebSocket API client used `os.path.exists(...)` without importing `os`, raising `NameError` at boot whenever a live configuration with an Ed25519 private key was detected.
+15. **Web Monitor Static-Serving Hardening (FIXED)** — `status.py --web` now percent-decodes URLs before any filesystem access and rejects every path-traversal form (`..`, `..%2f`, `%2e%2e`) with 403; unknown paths return 404 instead of serving the dashboard HTML, and requests outside `/` are no longer answered when no compiled `dist/` exists.
+16. **Simulated Candidates Clobbering Live Screeners (FIXED)** — while synced to a VPS, the React dashboard no longer overwrites the engine-scanned candidate pool with locally-simulated momentum rankings.
+17. **VPS `.env` Sync Credential Safety (FIXED)** — the 1-click SSH sync command now backs up the existing `.env` (`.env.bak.<timestamp>`) before overwriting and warns that `BINANCE_API_KEY` / `BINANCE_API_SECRET` must be preserved; the browser `POST /api/config` path remains a whitelist that never touches credentials.
+18. **Graceful Shutdown Hang (FIXED)** — SIGINT/SIGTERM previously cancelled `main()` itself mid-`finally` and then stopped the loop, so `ws_stream.disconnect()` hung forever on a torn-down WebSocket (`connection_lost_waiter` never resolved). PM2 `reload`/`restart` would hang and the single-instance lock stayed held, blocking the next start. Signal handlers now only set a shutdown event; `main()` cancels the background loops itself, then tears down connections with **bounded timeouts** (`ws_stream`/`ws_api` close with a 3s cap + transport abort; the REST client's periodic time-sync task is cancelled on close). Verified live under `PAPER_TRADE=true`: clean exit in ~5s, `Shutdown complete.` logged, lock released, no pending-task warnings.
+19. **PM2 Config Broken by ESM `package.json` (FIXED)** — the repo root `package.json` declares `"type": "module"`, so Node treated `ecosystem.config.js` (CommonJS) as ESM and `pm2 start ecosystem.config.js` failed with `ReferenceError: module is not defined`. The file is now `ecosystem.config.cjs` (explicit CommonJS), and every command/README/UI reference was updated. The full flow — `pm2 start ecosystem.config.cjs` → `POST /api/config` (whitelist push) → `pm2 reload ultimate-bot` — was verified end-to-end: reload exit code 0, restart count incremented, engine back online and holding the lock with the new config.
 
 ---
 
@@ -301,7 +309,7 @@ Set `PRESET=scalping|day|swing` in `.env`. Presets only apply where a key is **n
 
 ## 🏃 Running the Bot (PM2 Supervision)
 
-`ecosystem.config.js` launches two supervised processes:
+`ecosystem.config.cjs` launches two supervised processes:
 
 | App name | Purpose |
 |---|---|
@@ -310,7 +318,7 @@ Set `PRESET=scalping|day|swing` in `.env`. Presets only apply where a key is **n
 
 ```bash
 cd /path/to/ultimate-bot
-pm2 start ecosystem.config.js
+pm2 start ecosystem.config.cjs
 pm2 save
 pm2 startup        # survive reboots
 
@@ -336,14 +344,16 @@ pm2 restart bot-web-monitor         # restart the web monitor
 # Option 1 — direct (recommended for quick checks)
 ./venv/bin/python3 status.py --web 3000
 
-# Option 2 — supervised 24/7 via PM2 (already in ecosystem.config.js)
-pm2 start ecosystem.config.js
+# Option 2 — supervised 24/7 via PM2 (already in ecosystem.config.cjs)
+pm2 start ecosystem.config.cjs
 
 # Option 3 — prebuilt React dashboard (if a compiled ./dist exists next to status.py)
 npx serve -s dist -l 3000
 ```
 
-Then open `http://YOUR_VPS_IP:3000`. The React dashboard auto-connects to `/api/status` on the same origin, or you can point the **VPS Connection Bar** at any remote endpoint. If no compiled `dist/` is found, `status.py --web` falls back to a built-in standalone dark-mode dashboard.
+Then open `http://YOUR_VPS_IP:3000`. The React dashboard auto-connects to `/api/status` on the same origin, or you can point the **VPS Connection Bar** at any remote endpoint. If no compiled `dist/` is found, `status.py --web` falls back to a built-in standalone dark-mode dashboard that now includes a **Performance & Risk section** (win rate with W/L/B breakdown, profit factor, total realized PnL, average win/loss and the win/loss streak monitor) alongside the balance cards, market scanner, active positions and recent orders.
+
+> **Win-rate consistency**: wins, losses and breakevens are counted from **SELL exit orders that recorded a realized PnL** — never from BUY entries or un-filled orders — and the `win_rate` shown is `wins ÷ closed`. Partial-exit legs (recorded on `CANCELED` SELL orders) are included, so the numbers always reconcile with the engine's own streak and cooldown state.
 
 > **Candle subscription note**: the WebSocket market stream subscribes to each monitored symbol's `aggTrade` + `kline_<TIMEFRAME>` streams. Binance public streams are free and do not require an API key, but each connection is limited to 500 streams — the bot bounds symbol lists to that cap.
 
@@ -382,6 +392,25 @@ Notes:
 11. **Order-Quantity Edge Cases** — quantity strings are never allowed to become empty (which would send a blank `quantity` and get rejected), and `Decimal` quantization guards against floating-point step-size artifacts.
 12. **WebSocket Timeouts Are Retryable** — the authenticated WS-API client now retries the per-request `recv()` up to ~100 s before treating a response as lost, so momentary stalls don't abort orders.
 13. **Kline Cache Coherence** — completed kline updates are applied atomically so the tick price, ATR refresh, and gap-breach checks never see a partially-written candle.
+
+---
+
+## 🧪 Smoke Test
+
+`smoke_test.py` boots the real engine end-to-end against an **isolated temporary database** (your `data/trading.db`, `.env` and logs are never touched) and verifies:
+
+1. The engine boots and initializes the SQLite schema + `paper_balance` risk state.
+2. The single-instance lock is acquired.
+3. A second engine instance is rejected (`Another instance is already running`).
+4. The web monitor serves `/api/status` with **consistent** win/loss stats (`closed = W + L + B`), reports `RUNNING`, and provably reads the isolated temp DB (API numbers match a direct SQL query).
+5. SIGTERM shuts the engine down **cleanly** — exit code 0, `Shutdown complete.` in the log, no `Task was destroyed` warnings, lock released.
+
+```bash
+cd /path/to/ultimate-bot
+./venv/bin/python3 smoke_test.py    # exit 0 = all checks passed
+```
+
+It can also be run from the repo root via `npm run smoke`. Requires network access to Binance (the engine fetches `exchangeInfo` at boot) and a free `/tmp/ultimate_bot.lock` (stop any running engine first).
 
 ---
 

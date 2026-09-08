@@ -131,8 +131,12 @@ export interface VpsBotStatus {
     closed_trades: number;
     winning_trades: number;
     losing_trades: number;
+    breakeven_trades: number;
     total_realized_pnl: number;
     win_rate: number;
+    profit_factor: number;
+    avg_win: number;
+    avg_loss: number;
   };
 }
 

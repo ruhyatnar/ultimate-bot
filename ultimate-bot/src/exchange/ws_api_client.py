@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 import base64
 import aiohttp
@@ -80,16 +81,35 @@ class WSApiClient:
         current_task = asyncio.current_task()
         if self._monitor_task and self._monitor_task is not current_task:
             self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
             self._monitor_task = None
         if self.websocket:
+            # Bounded close so a torn-down session can never hang the shutdown path.
             try:
-                await self.websocket.close()
+                await asyncio.wait_for(self.websocket.close(), timeout=3.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
             except Exception:
                 pass
+            finally:
+                try:
+                    transport = getattr(self.websocket, "transport", None)
+                    if transport is not None:
+                        transport.abort()
+                except Exception:
+                    pass
             self.websocket = None
             self.connected = False
         if self._session:
-            await self._session.close()
+            try:
+                await asyncio.wait_for(self._session.close(), timeout=3.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            except Exception:
+                pass
             self._session = None
 
     def is_connected(self):

@@ -36,6 +36,7 @@ class RestClient:
         self._private_key = None
         self._initialized = False
         self._init_lock = asyncio.Lock()
+        self._time_sync_task = None
         if not config.get("PAPER_TRADE", False):
             pem_path = Path(self.private_key_path) if self.private_key_path else None
             if pem_path and pem_path.exists():
@@ -74,7 +75,7 @@ class RestClient:
             await self.sync_time()
             await self._load_exchange_info()
             self._initialized = True
-            asyncio.create_task(self._periodic_time_sync())
+            self._time_sync_task = asyncio.create_task(self._periodic_time_sync())
 
     async def _periodic_time_sync(self):
         while True:
@@ -85,6 +86,15 @@ class RestClient:
                 self.logger.warning(f"Periodic time sync failed: {e}")
 
     async def close(self):
+        # Cancel the periodic time-sync loop so it can't outlive the client or
+        # wedge the event loop as a pending task during shutdown.
+        if self._time_sync_task:
+            self._time_sync_task.cancel()
+            try:
+                await self._time_sync_task
+            except asyncio.CancelledError:
+                pass
+            self._time_sync_task = None
         if self.session:
             await self.session.close()
             self.session = None

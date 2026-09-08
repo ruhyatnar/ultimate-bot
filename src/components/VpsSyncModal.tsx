@@ -44,9 +44,14 @@ export const VpsSyncModal: React.FC<VpsSyncModalProps> = ({ config, onClose, vps
   const generateEnvContent = () => generateEnvString(config);
 
   // The web monitor (status.py --web) and engine are supervised by PM2 via
-  // ecosystem.config.js; only the engine needs a reload to pick up .env changes.
-  const bashCommand = `cat << 'EOF' > .env
+  // ecosystem.config.cjs; only the engine needs a reload to pick up .env changes.
+  // The full-file overwrite is preceded by a timestamped backup so a mistake can
+  // never destroy an existing configuration (credentials included) irrecoverably.
+  const bashCommand = `cp .env .env.bak.$(date +%s) 2>/dev/null || true
+cat << 'EOF' > .env
 ${generateEnvContent()}EOF
+# ⚠️ If you had a real BINANCE_API_KEY / BINANCE_API_SECRET on this VPS, verify the
+# new .env still contains them (the generated block only carries a placeholder).
 pm2 reload ultimate-bot`;
 
   const handleCopyBash = () => {
@@ -137,6 +142,12 @@ pm2 reload ultimate-bot`;
               <Sparkles className="w-4 h-4 text-amber-400" />
               <span>How Web-Tuned Parameters Sync to Your Debian 13 VPS</span>
             </div>
+            <p className="text-[11px] text-amber-300/90 bg-amber-950/40 border border-amber-700/40 rounded-lg p-2.5 mb-3">
+              ⚠️ <strong>Credentials safety:</strong> the 1-click command below replaces the whole <code className="text-amber-200">.env</code> and
+              writes a timestamped backup (<code className="text-amber-200">.env.bak.&lt;timestamp&gt;</code>) first. The generated block only contains a
+              placeholder <code className="text-amber-200">BINANCE_API_KEY</code> — on an existing deployment, restore your real key/secret from
+              the backup (or use the <em>Push to VPS</em> button, which applies only whitelisted tuning keys and never touches credentials).
+            </p>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-slate-300">
               <div className="bg-slate-900/60 p-2.5 rounded-lg border border-slate-800">
                 <span className="font-bold text-amber-400 block mb-1">1. Tune Interactively</span>
