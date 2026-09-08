@@ -44,10 +44,25 @@ _scanned_cache = {"ts": 0, "data": None}
 _tickers_cache = {"ts": 0, "data": {}}
 
 
-def load_env(env_path=".env"):
+def find_env_path(hint=None):
+    if hint and os.path.isfile(hint):
+        return os.path.abspath(hint)
+    candidates = [
+        ".env",
+        os.path.join(os.path.dirname(__file__), ".env"),
+        os.path.join(os.path.dirname(__file__), "..", ".env"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return os.path.abspath(c)
+    return os.path.abspath(".env")
+
+
+def load_env(env_path=None):
+    path = find_env_path(env_path)
     config = {}
-    if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf-8") as f:
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
@@ -1184,7 +1199,7 @@ def start_web_server(port, env_config, db_path):
                 if not updates:
                     self._send_json({"ok": False, "message": "No whitelisted tunable keys found in payload"}, status=400)
                     return
-                env_path = os.path.abspath(".env")
+                env_path = find_env_path()
                 applied = apply_env_updates(env_path, updates)
 
                 # Safety: if the pushed config would switch the engine from paper to live

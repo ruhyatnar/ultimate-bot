@@ -36,7 +36,8 @@ class HealthCheck:
                 self.pause_trading = True
                 await self.webhook.send("⚠️ Exchange maintenance detected. Pausing trading.")
         if self.enable_ws:
-            if self.ws_api and not self.config.get("PAPER_TRADE", False) and not self.ws_api.is_connected():
+            ws_can_connect = getattr(self.ws_api, "can_connect", lambda: True)() if self.ws_api else False
+            if self.ws_api and not self.config.get("PAPER_TRADE", False) and ws_can_connect and not self.ws_api.is_connected():
                 await self.reconnect("ws_api")
             if self.ws_stream and not self.ws_stream.is_connected():
                 await self.reconnect("ws_stream")

@@ -54,7 +54,8 @@ async def main():
     rest = RestClient(config)
     await rest.init()
 
-    ws_api = WSApiClient(config) if not config["PAPER_TRADE"] else None
+    has_private_key = bool(config.get("PRIVATE_KEY_PATH") and config["PRIVATE_KEY_PATH"].exists())
+    ws_api = WSApiClient(config) if (not config["PAPER_TRADE"] and has_private_key) else None
     ws_stream = WSStreamClient(config)
     risk = RiskManager(config, db, rest)
     await risk.load_state()

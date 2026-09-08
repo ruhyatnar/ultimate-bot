@@ -93,8 +93,8 @@ def load_config():
         raise ValueError("DISCORD_COOLDOWN must be a non-negative integer.")
     if not isinstance(config["LOG_LEVEL"], str) or config["LOG_LEVEL"].upper() not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
         raise ValueError("LOG_LEVEL must be one of DEBUG/INFO/WARNING/ERROR/CRITICAL.")
-    if not isinstance(config["MAX_SLIPPAGE_PERCENT"], (int, float)) or not (0 < config["MAX_SLIPPAGE_PERCENT"] <= 1):
-        raise ValueError("MAX_SLIPPAGE_PERCENT must be between 0 (exclusive) and 1.")
+    if not isinstance(config["MAX_SLIPPAGE_PERCENT"], (int, float)) or not (0 < config["MAX_SLIPPAGE_PERCENT"] <= 10.0):
+        raise ValueError("MAX_SLIPPAGE_PERCENT must be between 0 (exclusive) and 10.0 (percent).")
     if not isinstance(config["MIN_TP_PERCENT"], (int, float)) or config["MIN_TP_PERCENT"] < 0:
         raise ValueError("MIN_TP_PERCENT must be non-negative.")
     if not isinstance(config["BALANCE_USAGE_PERCENT"], (int, float)) or not (0 < config["BALANCE_USAGE_PERCENT"] <= 1):

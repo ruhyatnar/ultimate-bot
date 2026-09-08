@@ -115,11 +115,11 @@ class OrderManager:
             if order_id is None:
                 self.logger.error("Failed to get orderId")
                 return None
-            self.last_order_quantity = qty
+            self.last_order_quantity = float(qty)
             await self.db.save_order({
                 "order_id": str(order_id), "symbol": symbol, "side": side, "order_type": "MARKET",
                 "price": result.get("price"), "stop_price": result.get("stopPrice"),
-                "quantity": qty, "executed_qty": result.get("executedQty", 0),
+                "quantity": float(qty), "executed_qty": result.get("executedQty", 0),
                 "status": result.get("status", "NEW"), "created_at": int(time.time()*1000),
                 "updated_at": int(time.time()*1000), "profit_loss": 0,
                 "avg_fill_price": result.get("avgPrice")

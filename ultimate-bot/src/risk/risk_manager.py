@@ -180,7 +180,8 @@ class RiskManager:
 
     async def calculate_position_size(self, symbol, entry_price, stop_price):
         if self.total_equity <= 0 or entry_price <= 0:
-            return self.config["BASE_ORDER_SIZE"]
+            self.logger.warning(f"Position sizing skipped for {symbol}: total_equity={self.total_equity}, entry_price={entry_price}")
+            return 0.0
         allocation = Decimal(str(self.total_equity)) * Decimal(str(self.config["BALANCE_USAGE_PERCENT"]))
         max_symbol_alloc = Decimal(str(self.total_equity)) * Decimal(str(self.config["MAX_SYMBOL_ALLOCATION_PERCENT"]))
         allocation = min(allocation, max_symbol_alloc)

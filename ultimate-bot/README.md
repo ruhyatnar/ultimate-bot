@@ -94,6 +94,10 @@ All realized PnL is **net of 0.1% taker fees on both legs** (0.2% round-trip) so
 5. **Min Notional Floor** — every order is checked against `MIN_NOTIONAL` (Binance `NOTIONAL` filter). Keep at least $25–$100 USDT so allocations cleanly clear the $5–$10 floor.
 6. **Rejected Exit Orders Could Abandon Positions (FIXED)** — if an exit order is rejected (network outage, dust balance, exchange hiccup), the position is now re-armed with its stop and the next cycle retries the close. Remote `close_all` / `close_symbol` commands also retry rejected exits until every requested position is actually closed; new entries stay blocked while a close command is pending.
 7. **Gap-Breach Stop Could Miss Closed-Candle Wicks (FIXED)** — the stop/TP check now evaluates both the just-closed candle and the forming candle's low/high, not only the live tick, so a wick that pierced the stop on a candle that closed between polls is still caught.
+8. **Zero-Equity Entry Safeguard (FIXED)** — `calculate_position_size` explicitly returns `0.0` when total equity or entry price is non-positive, preventing an empty or wiped wallet from attempting to place fallback base orders.
+9. **8-Decimal Quantization & Formatting (FIXED)** — order quantity string generation now formats up to 8 decimal places (`.8f`), preventing truncation or scientific notation rejections on high-precision / low-price crypto assets (e.g. BTC, SHIB, PEPE).
+10. **High-Volatility Slippage Parameter Range (FIXED)** — `MAX_SLIPPAGE_PERCENT` validator expanded from `(0, 1]` to `(0, 10.0]`, allowing traders to set custom slippage thresholds for fast-moving pairs without boot-time errors.
+11. **Directory-Agnostic Environment Discovery (FIXED)** — `status.py` dynamically locates `.env` regardless of whether invoked from the project root or the `ultimate-bot/` directory.
 
 ---
 

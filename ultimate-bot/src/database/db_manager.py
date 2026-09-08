@@ -24,6 +24,7 @@ class DatabaseManager:
         await self.conn.execute("PRAGMA busy_timeout = 5000")
         self.read_conn = await aiosqlite.connect(self.db_path, isolation_level=None)
         await self.read_conn.execute("PRAGMA query_only = ON")
+        await self.read_conn.execute("PRAGMA busy_timeout = 5000")
         await self._create_tables()
         self._writer_task = asyncio.create_task(self._write_worker())
         self.logger.info("Database initialized.")

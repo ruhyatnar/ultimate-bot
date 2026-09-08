@@ -181,7 +181,10 @@ class RestClient:
         return await self._request("GET", "/api/v3/order", {"symbol": symbol, "orderId": order_id}, signed=True)
 
     async def place_order(self, symbol, side, order_type, quantity):
-        qty_str = f"{quantity:f}" if isinstance(quantity, float) else str(quantity)
+        if isinstance(quantity, (float, int)):
+            qty_str = f"{quantity:.8f}"
+        else:
+            qty_str = str(quantity)
         if "." in qty_str:
             qty_str = qty_str.rstrip("0").rstrip(".")
         if not qty_str:

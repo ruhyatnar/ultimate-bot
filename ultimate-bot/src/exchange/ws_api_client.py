@@ -29,11 +29,19 @@ class WSApiClient:
         self._monitor_task = None
         self._lock = asyncio.Lock()
         if not config.get("PAPER_TRADE", False):
-            with open(self.private_key_path, "rb") as f:
-                key = serialization.load_pem_private_key(f.read(), password=None)
-            if not isinstance(key, Ed25519PrivateKey):
-                raise ValueError("Not Ed25519")
-            self._private_key = key
+            if self.private_key_path and os.path.exists(str(self.private_key_path)):
+                try:
+                    with open(self.private_key_path, "rb") as f:
+                        key = serialization.load_pem_private_key(f.read(), password=None)
+                    if isinstance(key, Ed25519PrivateKey):
+                        self._private_key = key
+                    else:
+                        self.logger.warning("Configured private key is not Ed25519; WS API order execution disabled.")
+                except Exception as e:
+                    self.logger.warning(f"Could not load Ed25519 key from {self.private_key_path} ({e}); WS API order execution disabled.")
+
+    def can_connect(self):
+        return self._private_key is not None
 
     async def _get_session(self):
         if not self._session:
@@ -47,6 +55,9 @@ class WSApiClient:
             return data["serverTime"]
 
     async def connect(self):
+        if not self.can_connect():
+            self.logger.info("WebSocket API authentication requires an Ed25519 private key; orders will execute via REST.")
+            return
         retry_count = 0
         while True:
             try:
