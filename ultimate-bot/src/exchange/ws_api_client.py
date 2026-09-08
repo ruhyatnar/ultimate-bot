@@ -114,12 +114,17 @@ class WSApiClient:
             self.request_id += 1
             payload = {"id": req_id, "method": method, "params": params or {}}
             await self.websocket.send(json.dumps(payload))
-            while True:
+            tries = 0
+            max_tries = 20
+            while tries < max_tries:
+                tries += 1
                 try:
-                    resp = await asyncio.wait_for(self.websocket.recv(), timeout=15)
+                    resp = await asyncio.wait_for(self.websocket.recv(), timeout=5)
                 except asyncio.TimeoutError:
-                    self.logger.error("WebSocket API request timed out")
-                    raise
+                    if tries >= max_tries:
+                        self.logger.error("WebSocket API request timed out after retries")
+                        raise
+                    continue
                 data = json.loads(resp)
                 if data.get("id") == req_id:
                     if data.get("status") != 200:
@@ -145,6 +150,8 @@ class WSApiClient:
         qty_str = f"{quantity:f}" if isinstance(quantity, float) else str(quantity)
         if "." in qty_str:
             qty_str = qty_str.rstrip("0").rstrip(".")
+        if not qty_str:
+            qty_str = "0"
         params = {"symbol": symbol, "side": side, "type": order_type, "quantity": qty_str,
                   "timestamp": int(time.time() * 1000) + self.time_offset, "apiKey": self.api_key}
         query_string = "&".join([f"{k}={v}" for k, v in sorted(params.items())])

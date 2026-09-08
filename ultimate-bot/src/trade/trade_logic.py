@@ -66,30 +66,61 @@ class TradeLogic:
             self.logger.error(f"Failed to write engine control file: {e}")
 
     async def _process_control_commands(self):
-        """Execute one-shot remote commands (close_all / close_symbol) exactly once.
-        Commands are idempotent: closing a symbol with no open trade is a no-op."""
+        """Execute one-shot remote commands (close_all / close_symbol).
+
+        Commands are deduplicated via command_id, but a command is only cleared once it
+        has fully succeeded. If an exit order is rejected (network outage, dust balance,
+        exchange hiccup) close_trade() re-arms the position, so the command stays pending
+        and is retried on the next loop iteration instead of silently dropping a position
+        the operator asked to liquidate.
+
+        Returns True while a close command is still pending (entries stay blocked).
+        """
         control = self._read_control()
         cmd_id = control.get("command_id")
-        if not cmd_id or cmd_id == self._last_command_id:
-            return
+        if not cmd_id:
+            return False
+        is_new = cmd_id != self._last_command_id
         self._last_command_id = cmd_id
+
         if control.get("close_all"):
             open_symbols = list(self.active_trades.keys())
-            self.logger.warning(f"REMOTE CONTROL: closing ALL active positions ({len(open_symbols)})")
-            await self.webhook.send(f"🛑 REMOTE CONTROL: Close ALL requested ({len(open_symbols)} positions).")
-            for symbol in open_symbols:
-                await self.close_trade(symbol, "REMOTE_CLOSE_ALL")
+            if is_new and open_symbols:
+                self.logger.warning(f"REMOTE CONTROL: closing ALL active positions ({len(open_symbols)})")
+                await self.webhook.send(f"🛑 REMOTE CONTROL: Close ALL requested ({len(open_symbols)} positions).")
+            for symbol in list(open_symbols):
+                if symbol in self.active_trades:
+                    await self.close_trade(symbol, "REMOTE_CLOSE_ALL")
+            # If any exit was rejected and re-armed, keep the command so it retries.
+            if any(s in self.active_trades for s in open_symbols):
+                self.logger.warning("REMOTE CONTROL: some close-all exits were rejected; command stays pending and will retry.")
+                return True
             control.pop("close_all", None)
             control.pop("command_id", None)
             self._write_control(control)
-        elif control.get("close_symbol"):
+            return False
+
+        if control.get("close_symbol"):
             symbol = str(control.get("close_symbol", "")).strip().upper()
-            self.logger.warning(f"REMOTE CONTROL: closing {symbol}")
-            await self.webhook.send(f"🛑 REMOTE CONTROL: Close {symbol} requested.")
-            await self.close_trade(symbol, "REMOTE_CLOSE")
+            if is_new:
+                self.logger.warning(f"REMOTE CONTROL: closing {symbol}")
+                await self.webhook.send(f"🛑 REMOTE CONTROL: Close {symbol} requested.")
+            if symbol in self.active_trades:
+                await self.close_trade(symbol, "REMOTE_CLOSE")
+                if symbol in self.active_trades:
+                    self.logger.warning(f"REMOTE CONTROL: exit rejected for {symbol}; command stays pending and will retry.")
+                    return True
             control.pop("close_symbol", None)
             control.pop("command_id", None)
             self._write_control(control)
+            return False
+
+        # Stale/malformed command (no recognized action): clear it so it never wedges.
+        control.pop("command_id", None)
+        control.pop("close_all", None)
+        control.pop("close_symbol", None)
+        self._write_control(control)
+        return False
 
     def _ws_stream_proxy(self, stream, rest):
         """Wrap the stream client so price reads transparently fall back to REST
@@ -178,14 +209,17 @@ class TradeLogic:
     async def run(self):
         while True:
             # Remote web-monitor commands first so emergency closes always win
-            # over every other gate below.
-            await self._process_control_commands()
+            # over every other gate below. Returns True while a close command is
+            # still being retried (some exits were rejected) — keep blocking new
+            # entries until the liquidation fully completes.
+            pending_close = await self._process_control_commands()
 
             control = self._read_control()
-            if control.get("paused"):
+            if control.get("paused") or pending_close:
                 # Web-monitor pause: block NEW entries but keep managing open
                 # positions so stops/TPs/trailing stays armed while the operator
-                # reviews the market.
+                # reviews the market. The same holds while a remote close command
+                # is still retrying rejected exits.
                 self.logger.debug("Web-monitor pause ACTIVE — new entries blocked; managing open positions only.")
                 for symbol in list(self.active_trades.keys()):
                     try:
@@ -261,8 +295,6 @@ class TradeLogic:
         if signal != "BUY":
             self.logger.debug(f"{symbol}: enter_trade called with signal={signal}; spot long-only engine ignores it.")
             return
-        # Professional guard: hard cap total capital deployed (equity * BALANCE_USAGE_PERCENT).
-        deployed = sum(t["quantity"] * t["entry_price"] for t in self.active_trades.values())
         price = await self.ws_stream.get_current_price(symbol)
         if not price:
             self.logger.warning(f"{symbol}: no live price available (WS stale & REST ticker failed); skipping entry.")
@@ -275,12 +307,19 @@ class TradeLogic:
             take_profit = entry_price + min_tp_dist
         side = "BUY"
 
+        # Hard cap total capital deployed (equity * BALANCE_USAGE_PERCENT).
+        # Computed AFTER the live price is known so the cap shares the same benchmark.
+        deployed = sum(t["quantity"] * t["entry_price"] for t in self.active_trades.values())
+        remaining = self.config["BALANCE_USAGE_PERCENT"] * self.risk_mgr.total_equity - deployed
+        if remaining <= 0:
+            self.logger.info(f"{symbol}: no remaining allocation headroom (${remaining:.2f}); skipping entry.")
+            return
+
         qty = await self.risk_mgr.calculate_position_size(symbol, entry_price, stop_price)
         if not qty or qty <= 0:
             self.logger.info(f"{symbol}: position size 0 (equity/fee/minNotional caps) — entry skipped.")
             return
         # Enforce the total-capital cap after sizing (planned notional vs remaining headroom)
-        remaining = self.config["BALANCE_USAGE_PERCENT"] * self.risk_mgr.total_equity - deployed
         if qty * entry_price > remaining:
             self.logger.info(f"{symbol}: planned notional ${qty * entry_price:.2f} exceeds remaining allocation headroom ${remaining:.2f}; skipping entry.")
             return
@@ -350,21 +389,25 @@ class TradeLogic:
                     self.last_atr_update[symbol] = now
 
         if trade["side"] == "BUY":
-            # Gap-breach protection: compare against the LOW of the bar, not just the
+            # Gap-breach protection: compare against bar LOWS/HIGHS, not just the
             # current tick. A tick-based check alone misses violent wicks that spike
             # through the stop between SIGNAL_INTERVAL polls and bounce back — the #1
-            # cause of unexpected deep losses in live market-only bots.
+            # cause of unexpected deep losses in live market-only bots. We evaluate
+            # both the just-closed candle and the forming one (the exchange returns
+            # them newest-last) so a wick on a candle that closed between polls is
+            # still caught, not only the one that happens to be open right now.
             recent = await self.rest.get_klines(symbol, self.config["TIMEFRAME"], 2)
             if recent:
                 try:
                     df = pd.DataFrame(recent, columns=['open_time','open','high','low','close','volume','close_time','quote_volume','trades','taker_buy_base','taker_buy_quote','ignore'])
-                    low = float(df['low'].iloc[-1])
-                    high = float(df['high'].iloc[-1])
+                    low = min(float(v) for v in df['low'].tail(2).tolist())
+                    high = max(float(v) for v in df['high'].tail(2).tolist())
                 except Exception:
                     low = price
                     high = price
+                # Evaluate both just-closed and forming candles (newest-last from the
+                # exchange) so a wick on a candle that closed between polls still triggers.
                 if low <= trade["stop_price"]:
-                    # Fill at the worse of stop or actual low — conservative live fill assumption
                     await self.close_trade(symbol, "STOP_LOSS", fill_override=min(trade["stop_price"], low))
                     return
                 if high >= trade["take_profit"]:
@@ -500,11 +543,11 @@ class TradeLogic:
 
                     # If remaining free base is marketable on Binance, treat as partial.
                     # Otherwise, it's non-tradable dust/fee remainder: position is closed!
-                    if free_base * fill_price >= min_notional and free_base >= min_qty:
+                    if free_base >= min_qty and free_base * fill_price >= min_notional:
                         is_partial = True
                         remaining_qty = free_base
                     else:
-                        self.logger.info(f"{symbol}: Remaining base {free_base} ({free_base * fill_price:.2f} USDT) is non-tradable dust (< minNotional {min_notional}). Marking trade as FULL EXIT.")
+                        self.logger.info(f"{symbol}: Remaining base {free_base} ({free_base * fill_price:.2f} USDT) is non-tradable dust (< minNotional {min_notional} or < minQty {min_qty}). Marking trade as FULL EXIT.")
                         is_partial = False
                         remaining_qty = 0.0
                 except Exception as e:
@@ -519,6 +562,10 @@ class TradeLogic:
         total_fees = (entry_cost + exit_cost) * fee_rate
         gross_pnl = (fill_price - trade["entry_price"]) * executed_qty
         pnl = gross_pnl - total_fees
+        # Sanity clamp: a wildly off fill_price (e.g. a 0 fallback) would produce nonsensical PnL.
+        # Keep the calculation but flag it so logs are interpretable.
+        if fill_price <= 0:
+            self.logger.error(f"{symbol}: exit fill_price was non-positive ({fill_price}); PnL may be unreliable.")
 
         # In live trading, purge any lingering open orders for this symbol on Binance to prevent orphan execution
         if not self.config["PAPER_TRADE"]:
@@ -549,6 +596,18 @@ class TradeLogic:
         emoji = "✅" if pnl >= 0 else "❌"
         await self.webhook.send(f"{emoji} CLOSE {symbol} ({reason}) Net PnL: {pnl:+.2f} USDT (Gross: {gross_pnl:+.2f}, Fees: -{total_fees:.2f})")
         self.logger.info(f"Closed {symbol} due to {reason}, Net PnL: {pnl:.2f} (Gross: {gross_pnl:.2f}, Fees: -{total_fees:.2f})")
+
+        # Clean up pending remote-control state if this was a requested close.
+        control = self._read_control()
+        if control.get("close_all") or control.get("close_symbol"):
+            symbol_key = control.get("close_symbol", "").strip().upper()
+            if not control.get("close_all") and symbol_key and symbol_key == symbol:
+                self.logger.info(f"Remote close_symbol for {symbol} fully completed.")
+            elif control.get("close_all"):
+                # close_all may have targeted multiple symbols; only clear if this symbol
+                # was part of that request and is now gone from active_trades.
+                if symbol not in self.active_trades:
+                    self.logger.info(f"Remote close_all: {symbol} fully closed.")
 
     async def reconcile_positions(self):
         self.logger.info("Reconciling positions...")

@@ -434,7 +434,11 @@ def fetch_scanned_pairs(env_config, db_data):
                     sym = t.get("symbol", "")
                     if not sym.endswith(quote):
                         continue
-                    if any(x in sym for x in ["UP", "DOWN", "BEAR", "BULL"]):
+                    # Leveraged tokens carry UP/DOWN/BEAR/BULL as a base-asset suffix
+                    # (e.g. BTCUPUSDT). Only exclude on that boundary — a raw substring
+                    # test would wrongly drop legit pairs like SUPERUSDT.
+                    base = sym[: -len(quote)] if quote else sym
+                    if any(base.endswith(x) for x in ("UP", "DOWN", "BEAR", "BULL")):
                         continue
                     try:
                         last_p = float(t.get("lastPrice", 0.0))
@@ -631,7 +635,7 @@ def render_dashboard(env_config, db_path):
 
     output.append(f"\n{BOLD} 🛡️ RISK METRICS & PERFORMANCE STATS{RESET}")
     output.append(f"  Win Rate       : {BOLD}{win_rate:.1f}%{RESET} ({stats.get('winning_trades', 0)} wins / {stats.get('closed_trades', 0)} closed trades)")
-    output.append(f"  Streak Monitor : Win Streak: {GREEN}{win_streak}{RESET}/{env_config.get('MAX_WIN_STREAK', '3')}    Loss Streak: {RED}{loss_streak}{RESET}/{env_config.get('MAX_LOSS_STREAK', '2')}")
+    output.append(f"  Streak Monitor : Win Streak: {GREEN}{win_streak}{RESET}/{env_config.get('MAX_WIN_STREAK', '5')}    Loss Streak: {RED}{loss_streak}{RESET}/{env_config.get('MAX_LOSS_STREAK', '3')}")
     output.append(f"  Total Realized : {GREEN if stats.get('total_realized_pnl', 0)>=0 else RED}${stats.get('total_realized_pnl', 0):+,.2f} {quote}{RESET}    Daily DD Limit : {max_dd:.1f}%")
 
     output.append(f"\n{CYAN}----------------------------------------------------------------------------------------{RESET}")
@@ -1122,8 +1126,17 @@ def start_web_server(port, env_config, db_path):
 
             if clean_path == "/api/control":
                 control_path = env_config.get("CONTROL_FILE", "./data/engine_control.json")
-                control = read_control(control_path)
+                # Idempotency: if the caller re-posts the same action+identifier we treat
+                # it as a no-op rather than stacking duplicate close_all/close_symbol
+                # commands (each would generate a new command_id and compete).
                 action = body.get("action")
+                existing_cmd_id = body.get("command_id")
+                existing_control = read_control(control_path)
+                if existing_cmd_id and existing_control.get("command_id") == existing_cmd_id:
+                    public_control = {k: v for k, v in existing_control.items() if k != "command_id"}
+                    self._send_json({"ok": True, "action": action, "control": public_control, "duplicate": True})
+                    return
+                control = dict(existing_control)
                 if action == "pause":
                     control["paused"] = True
                     control["pause_reason"] = body.get("reason", "paused from web monitor")
@@ -1138,11 +1151,24 @@ def start_web_server(port, env_config, db_path):
                     if not symbol:
                         self._send_json({"ok": False, "message": "symbol is required for close_symbol"}, status=400)
                         return
+                    # If a close_symbol is already pending for the same symbol, re-use it
+                    # rather than writing a second command that races the first.
+                    pending = control.get("close_symbol", "")
+                    if pending and str(pending).strip().upper() == symbol and not body.get("force"):
+                        public_control = {k: v for k, v in control.items() if k != "command_id"}
+                        self._send_json({"ok": True, "action": action, "control": public_control, "duplicate": True})
+                        return
                     control["close_symbol"] = symbol
                     control["command_id"] = str(uuid.uuid4())
                 else:
                     self._send_json({"ok": False, "message": f"Unknown action: {action}"}, status=400)
                     return
+                # Clear any stale command_id that belonged to a now-resolved request so a
+                # new request can get a fresh identifier.
+                if action in ("pause", "resume"):
+                    control.pop("command_id", None)
+                    control.pop("close_all", None)
+                    control.pop("close_symbol", None)
                 write_control(control_path, control)
                 public_control = {k: v for k, v in control.items() if k != "command_id"}
                 self._send_json({"ok": True, "action": action, "control": public_control})
@@ -1175,6 +1201,10 @@ def start_web_server(port, env_config, db_path):
                         "attempted": False,
                         "hint": "pm2 not detected — run 'pm2 reload ultimate-bot' (or restart the engine) to apply."
                     }
+                # Do NOT clear a pending close command when a config push happens. A
+                # pending close_all / close_symbol that is still retrying rejected exits
+                # must survive the .env/Pm2 reload so the operator's emergency request is
+                # not silently dropped mid-liquidation.
                 self._send_json(result)
                 return
 

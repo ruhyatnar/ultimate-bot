@@ -30,11 +30,17 @@ class TrendDetector:
         tickers = await self.rest.get_24hr_tickers()
         if not tickers:
             return self.config["STATIC_SYMBOLS"]
-        exclude = set(self.config["EXCLUDE_SYMBOLS"])
+        exclude = [ex.upper().strip() for ex in self.config["EXCLUDE_SYMBOLS"] if ex.strip()]
         candidates = []
         for t in tickers:
             symbol = t["symbol"]
-            if not symbol.endswith(self.quote_asset) or any(ex in symbol for ex in exclude):
+            if not symbol.endswith(self.quote_asset):
+                continue
+            base = symbol[: -len(self.quote_asset)] if self.quote_asset else symbol
+            # Match excluded tokens only on the base-asset boundary (exact base or a
+            # suffix like leveraged "BTCUP"). A raw substring test wrongly drops legit
+            # pairs whose ticker merely contains those letters (e.g. SUPERUSDT).
+            if base in exclude or any(base.endswith(ex) for ex in exclude if ex):
                 continue
             if not self._is_valid_symbol(symbol):
                 continue
@@ -127,15 +133,21 @@ class TrendDetector:
 
     def _get_trend_direction(self, df):
         if len(df) < 50: return "NEUTRAL"
-        df['ema20'] = df['close'].ewm(span=20).mean()
-        df['ema50'] = df['close'].ewm(span=50).mean()
-        if df['ema20'].iloc[-1] > df['ema50'].iloc[-1]: return "UP"
-        elif df['ema20'].iloc[-1] < df['ema50'].iloc[-1]: return "DOWN"
+        df = df.copy()
+        df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
+        df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+        ema20_last = df['ema20'].iloc[-1]
+        ema50_last = df['ema50'].iloc[-1]
+        if pd.isna(ema20_last) or pd.isna(ema50_last):
+            return "NEUTRAL"
+        if ema20_last > ema50_last: return "UP"
+        elif ema20_last < ema50_last: return "DOWN"
         return "NEUTRAL"
 
     def _detect_breakout(self, df):
         if len(df) < 21: return "NEUTRAL"
         prior = df.iloc[-21:-1]
+        if prior.empty: return "NEUTRAL"
         high, low = prior['high'].max(), prior['low'].min()
         close = df['close'].iloc[-1]
         if close > high: return "BREAKOUT_UP"

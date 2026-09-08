@@ -184,6 +184,8 @@ class RestClient:
         qty_str = f"{quantity:f}" if isinstance(quantity, float) else str(quantity)
         if "." in qty_str:
             qty_str = qty_str.rstrip("0").rstrip(".")
+        if not qty_str:
+            qty_str = "0"
         params = {"symbol": symbol, "side": side, "type": order_type, "quantity": qty_str}
         return await self._request("POST", "/api/v3/order", params, signed=True)
 

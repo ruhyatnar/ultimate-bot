@@ -23,9 +23,25 @@ class RiskManager:
         if last_reset: self.last_reset_date = datetime.fromisoformat(last_reset)
         paper_balance_str = await self.db.get_risk_state("paper_balance")
         if paper_balance_str: self.paper_balance = float(paper_balance_str)
+        # Restore per-symbol streak/cooldown state for EVERY persisted symbol, not just
+        # the static list. Dynamic-screen symbols are stored as risk_<SYMBOL> rows too;
+        # ignoring them on restart would silently reset cooldowns and let a symbol that
+        # was cooling down re-enter immediately after a restart.
+        try:
+            rows = await self.db.fetch_all("SELECT key, value FROM risk_state")
+            for key, val in (rows or []):
+                if key.startswith("risk_") and val:
+                    symbol = key[len("risk_"):]
+                    try:
+                        state = json.loads(val)
+                        if isinstance(state, dict):
+                            self.symbol_states[symbol] = state
+                    except (ValueError, TypeError):
+                        continue
+        except Exception as e:
+            self.logger.warning(f"Could not restore per-symbol risk state from DB: {e}")
         for symbol in self.config["STATIC_SYMBOLS"]:
-            val = await self.db.get_risk_state(f"risk_{symbol}")
-            self.symbol_states[symbol] = json.loads(val) if val else {"loss_streak":0, "win_streak":0, "cooldown_until":0}
+            self.symbol_states.setdefault(symbol, {"loss_streak": 0, "win_streak": 0, "cooldown_until": 0})
         if self.config.get("PAPER_TRADE", False):
             self.total_equity = self.paper_balance
             self.logger.info(f"Paper trading mode: simulated equity {self.total_equity} USDT.")

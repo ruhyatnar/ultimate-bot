@@ -43,10 +43,11 @@ export const VpsSyncModal: React.FC<VpsSyncModalProps> = ({ config, onClose, vps
 
   const generateEnvContent = () => generateEnvString(config);
 
+  // The web monitor (status.py --web) and engine are supervised by PM2 via
+  // ecosystem.config.js; only the engine needs a reload to pick up .env changes.
   const bashCommand = `cat << 'EOF' > .env
 ${generateEnvContent()}EOF
-pm2 reload ultimate-bot
-./venv/bin/python3 status.py`;
+pm2 reload ultimate-bot`;
 
   const handleCopyBash = () => {
     navigator.clipboard.writeText(bashCommand);

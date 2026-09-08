@@ -145,9 +145,9 @@ class OrderManager:
                     avg_fill_price = float(status.get("avgPrice", status.get("price", 0)))
                     await self.db.update_order_status(order_id, "FILLED", executed_qty, avg_fill_price)
                     return True, executed_qty
-                elif status["status"] in ["CANCELED", "EXPIRED", "REJECTED"]:
+                el            if status["status"] in ["CANCELED", "EXPIRED", "REJECTED", "FILLED"]:
                     await self.db.update_order_status(order_id, status["status"], 0)
-                    return False, 0
+                    return status["status"] == "FILLED", float(status.get("executedQty", 0))
             except Exception as e:
                 self.logger.warning(f"Polling order {order_id} error: {e}")
             await asyncio.sleep(1)

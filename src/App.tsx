@@ -367,6 +367,7 @@ export default function App() {
   }, [useLiveBinanceFeed, addLog, ensureCandlesForSymbol, selectedPinnedSymbols]);
 
   // Real VPS Data Fetcher (reads SQLite trading.db and PM2 engine state via status.py HTTP endpoint)
+  // Re-created when its deps change so the polling useEffect can re-subscribe.
   const fetchVpsData = useCallback(async () => {
     if (dataSource !== 'vps') return;
     setIsPollingVps(true);
@@ -755,18 +756,20 @@ export default function App() {
 
   // Close an active trade safely with unique closed ID.
   // PnL is NET of round-trip taker fees (0.2%) so paper results match live expectations.
-  const handleCloseTrade = useCallback((symbol: string, reason: string, customExitPrice?: number) => {
+  // Returns the realized PnL delta so the tick loop can fold it into its local drawdown
+  // mirror (React state writes are asynchronous).
+  const handleCloseTrade = useCallback((symbol: string, reason: string, customExitPrice?: number): number => {
     if (dataSourceRef.current === 'vps' && vpsStatusRef.current.connected) {
       sendVpsControl('close_symbol', symbol).then(ok => {
         if (ok) {
           addLog('WARN', 'ORDER', `Manual market close requested for ${symbol} on live VPS engine.`, symbol);
         }
       });
-      return;
+      return 0;
     }
 
     const trade = activeTradesRef.current.find(t => t.symbol === symbol);
-    if (!trade) return;
+    if (!trade) return 0;
 
     const exitPrice = customExitPrice ?? trade.currentPrice;
     const grossPnl = (exitPrice - trade.entryPrice) * trade.quantity;
@@ -820,6 +823,7 @@ export default function App() {
 
     // Short per-symbol re-entry cooldown (mirrors self.symbol_cooldowns in trade_logic.py)
     cooldownsRef.current[symbol] = Date.now() + 10_000;
+    return pnl;
   }, [addLog]);
 
   // Emergency Close All Trades — remotely liquidates the live engine when in
@@ -838,37 +842,39 @@ export default function App() {
     addLog('WARN', 'RISK', `EMERGENCY LIQUIDATION: Closed all ${open.length} open market positions.`);
   }, [handleCloseTrade, addLog, sendVpsControl]);
 
-  // Execute a market buy trade (Simulator mode only — the real engine lives on the VPS)
-  const executeTrade = useCallback((symbol: string, currentPrice: number, atr: number, triggerSource: string = 'SIGNAL') => {
+  // Execute a market buy trade (Simulator mode only — the real engine lives on the VPS).
+  // Returns true when a trade was actually opened so tick loops can enforce the max-position
+  // cap against *this tick's* openings (state refs only update after a re-render).
+  const executeTrade = useCallback((symbol: string, currentPrice: number, atr: number, triggerSource: string = 'SIGNAL'): boolean => {
     if (dataSourceRef.current === 'vps') {
       addLog('WARN', 'ORDER', `${symbol}: manual entries are disabled while synced to the live VPS engine. Switch to Strategy Simulator for testing.`, symbol);
-      return;
+      return false;
     }
 
     // Check max open trades
     if (activeTradesRef.current.length >= configRef.current.maxSymbols) {
       addLog('WARN', 'ORDER', `Max open trades reached (${activeTradesRef.current.length}/${configRef.current.maxSymbols}). Skipping ${symbol}.`, symbol);
-      return;
+      return false;
     }
 
     // Check if already open
     if (activeTradesRef.current.some(t => t.symbol === symbol)) {
       addLog('DEBUG', 'ORDER', `${symbol} already has an active position. Skipping duplicate entry.`, symbol);
-      return;
+      return false;
     }
 
     // Loss-streak cooldown gate (mirrors MAX_LOSS_STREAK / COOLDOWN_LOSS in the Python engine)
     if (Date.now() < cooldownUntilRef.current) {
       const remaining = Math.ceil((cooldownUntilRef.current - Date.now()) / 1000);
       addLog('WARN', 'RISK', `Loss-streak cooldown ACTIVE. Entries paused for another ${remaining}s.`, symbol);
-      return;
+      return false;
     }
 
     // Per-symbol re-entry cooldown
     const symCooldown = cooldownsRef.current[symbol] || 0;
     if (Date.now() < symCooldown) {
       addLog('DEBUG', 'ORDER', `${symbol} in re-entry cooldown for ${Math.ceil((symCooldown - Date.now()) / 1000)}s.`, symbol);
-      return;
+      return false;
     }
 
     // Position sizing: capped by BOTH total usage and per-symbol allocation,
@@ -879,7 +885,7 @@ export default function App() {
     // Binance rejects orders below MIN_NOTIONAL — skip instead of sizing up.
     if (allocation < MIN_NOTIONAL_USDT || curEquity < MIN_NOTIONAL_USDT) {
       addLog('WARN', 'ORDER', `${symbol}: allocation $${allocation.toFixed(2)} below Binance MIN_NOTIONAL ($${MIN_NOTIONAL_USDT}). Order would be rejected live — skipped.`, symbol);
-      return;
+      return false;
     }
 
     const quantity = allocation / currentPrice;
@@ -918,6 +924,7 @@ export default function App() {
       `ENTRY MARKET BUY ${quantity.toFixed(4)} ${symbol} @ $${currentPrice.toFixed(2)} [SL: $${stopPrice.toFixed(2)}, TP: $${takeProfit.toFixed(2)}] (${triggerSource})`,
       symbol
     );
+    return true;
   }, [addLog]);
 
   // Manual Buy simulation
@@ -965,7 +972,18 @@ export default function App() {
     const curActiveTrades = activeTradesRef.current;
     const curEquity = equityRef.current;
     const curDailyPnl = dailyRealizedPnlRef.current;
+    // Re-read these each tick so a concurrent VPS sync or user slider can be picked
+    // up without waiting for the next re-render cycle.
+    const curWinStreak = winStreak;
+    const curLossStreak = lossStreak;
+    const curCooldownEndsAt = cooldownEndsAt;
     const now = Date.now();
+
+    // Best-effort mirror of the draw-down state that the closure batch will mutate.
+    // React state writes are asynchronous, so we keep a local number in sync so the
+    // drawdown gate immediately below sees this tick's net closes. When the UI re-
+    // renders it will pick up the authoritative committed value from the ref.
+    let committedDailyPnl = curDailyPnl;
 
     // 1. Gather ALL candidate symbols
     const allCandidateKeys = Array.from(new Set([
@@ -1079,6 +1097,9 @@ export default function App() {
     // If connected to live VPS, the real bot processes all trades and orders on the server.
     // We only update unrealized PnL with the latest live market price without generating fake local trades.
     if (curDataSource === 'vps') {
+      // Derive a per-symbol price from either the freshly computed symbol data or the
+      // existing tracked price — a missing symbol in updatedSymbols should never drop a
+      // position's displayed price to zero.
       setActiveTrades(prev => prev.map(t => {
         const symData = updatedSymbols.find(s => s.symbol === t.symbol);
         const livePrice = symData ? symData.price : t.currentPrice;
@@ -1102,6 +1123,8 @@ export default function App() {
 
       prevTrades.forEach(trade => {
         const symData = updatedSymbols.find(s => s.symbol === trade.symbol);
+        // Never drop to zero just because a symbol is momentarily absent from the
+        // monitor list — fall back to the last known price.
         const livePrice = symData ? symData.price : trade.currentPrice;
 
         let trailingActive = trade.trailingActive;
@@ -1170,16 +1193,31 @@ export default function App() {
       return remainingTrades;
     });
 
-    // Execute closures cleanly outside of the setActiveTrades updater
-    tradesToClose.forEach(({ symbol, reason, exitPrice }) => {
-      handleCloseTrade(symbol, reason, exitPrice);
-    });
+    // Execute closures cleanly outside of the setActiveTrades updater.
+    // Because setDailyRealizedPnl is asynchronous, fold each close's realized PnL into
+    // our local mirror so the drawdown gate right below sees this tick's net closes.
+    if (tradesToClose.length > 0) {
+      tradesToClose.forEach(({ symbol, reason, exitPrice }) => {
+        const pnl = handleCloseTrade(symbol, reason, exitPrice);
+        if (typeof pnl === 'number') committedDailyPnl += pnl;
+      });
+      dailyRealizedPnlRef.current = committedDailyPnl;
+    }
 
     // 4. Confluence Evaluation & Execution
-    const drawdownExceeded = curEquity > 0 && curDailyPnl <= -curConfig.maxDailyDrawdown * curEquity;
+    // Drawdown gate mirrors the Python engine: realized daily PnL PLUS current
+    // unrealized PnL against MAX_DAILY_DRAWDOWN of equity.
+    const floatingPnl = curActiveTrades.reduce((acc, t) => acc + ((t.currentPrice - t.entryPrice) * t.quantity), 0);
+    const drawdownExceeded = curEquity > 0 && (committedDailyPnl + floatingPnl) <= -curConfig.maxDailyDrawdown * curEquity;
     if (drawdownExceeded) {
-      addLog('WARN', 'RISK', `Max daily drawdown exceeded (${(curConfig.maxDailyDrawdown * 100).toFixed(1)}%). All new entries blocked until UTC reset.`);
+      addLog('WARN', 'RISK', `Max daily drawdown exceeded (${(curConfig.maxDailyDrawdown * 100).toFixed(1)}% incl. floating). All new entries blocked until UTC reset.`);
     }
+
+    // Max-position enforcement across THIS tick: state refs only update after a
+    // re-render, so without a local counter several symbols could each pass the
+    // "max open trades" check and overshoot the cap in a single tick.
+    const openSlots = Math.max(0, curConfig.maxSymbols - curActiveTrades.length);
+    let openedThisTick = 0;
 
     updatedSymbols.forEach(sym => {
       const f = sym.factors;
@@ -1192,6 +1230,11 @@ export default function App() {
 
       if (drawdownExceeded) return;
 
+      if (openedThisTick >= openSlots) {
+        addLog('DEBUG', 'SIGNAL', `${sym.symbol} SKIPPED: max positions already reached this tick (${curActiveTrades.length + openedThisTick}/${curConfig.maxSymbols}).`, sym.symbol);
+        return;
+      }
+
       // Confluence check
       const meetsThreshold = f.bullishScore >= curConfig.signalThreshold;
 
@@ -1202,7 +1245,9 @@ export default function App() {
           `BUY signal triggered: HTF=${f.htfTrend}, BOS=${f.bos}, FVG=${f.fvg > 0 ? '+' : f.fvg < 0 ? '-' : '0'}, CVD=${f.cvd > 0 ? '+' : '-'}, POC=${f.currentPrice > f.poc ? '>' : '<'} (Confluence: ${f.bullishScore}/5 >= ${curConfig.signalThreshold})`,
           sym.symbol
         );
-        executeTrade(sym.symbol, sym.price, f.atr, '5-FACTOR CONFLUENCE');
+        if (executeTrade(sym.symbol, sym.price, f.atr, '5-FACTOR CONFLUENCE')) {
+          openedThisTick += 1;
+        }
       } else {
         addLog(
           'DEBUG', 
@@ -1217,22 +1262,22 @@ export default function App() {
   // Keep runTickRef synchronized
   useEffect(() => {
     runTickRef.current = runTick;
-  }, [runTick]);
-
-  // Main Bot Tick Loop
+  }, [runTick]);    // Main Bot Tick Loop
   useEffect(() => {
     if (!isRunning) return;
 
+    // Run an initial tick synchronously after mount so the dashboard is populated
+    // immediately instead of waiting for the first interval firing.
     runTick();
 
     const interval = setInterval(() => {
       if (runTickRef.current) {
         runTickRef.current();
       }
-    }, (config.signalInterval || 6) * 1000);
+    }, Math.max(1000, (config.signalInterval || 6) * 1000));
 
     return () => clearInterval(interval);
-  }, [isRunning, config.signalInterval, runTick]);
+  }, [isRunning, config.signalInterval]);
 
   const totalUnrealizedPnl = useMemo(
     () => activeTrades.reduce((acc, t) => acc + t.unrealizedPnl, 0),

@@ -44,9 +44,18 @@ class SignalGenerator:
         atr = self._calculate_atr(ltf_df)
         current_atr = atr.iloc[-1] if not pd.isna(atr.iloc[-1]) and atr.iloc[-1] > 0 else ltf_df['close'].iloc[-1] * 0.001
 
-        htf_df['ema50'] = htf_df['close'].ewm(span=50).mean()
-        htf_df['ema200'] = htf_df['close'].ewm(span=200).mean()
-        htf_trend = "UP" if htf_df['ema50'].iloc[-1] > htf_df['ema200'].iloc[-1] else "DOWN" if htf_df['ema50'].iloc[-1] < htf_df['ema200'].iloc[-1] else "NEUTRAL"
+        htf_df['ema50'] = htf_df['close'].ewm(span=50, adjust=False).mean()
+        htf_df['ema200'] = htf_df['close'].ewm(span=200, adjust=False).mean()
+        ema50_last = htf_df['ema50'].iloc[-1]
+        ema200_last = htf_df['ema200'].iloc[-1]
+        if pd.isna(ema50_last) or pd.isna(ema200_last):
+            htf_trend = "NEUTRAL"
+        elif ema50_last > ema200_last:
+            htf_trend = "UP"
+        elif ema50_last < ema200_last:
+            htf_trend = "DOWN"
+        else:
+            htf_trend = "NEUTRAL"
 
         swings_high, swings_low = self._detect_swings(ltf_df)
         current_price = ltf_df['close'].iloc[-1]
@@ -89,14 +98,18 @@ class SignalGenerator:
     def _detect_swings(self, df):
         highs, lows = df['high'].values, df['low'].values
         lookback = self.config["SWING_LOOKBACK"]
+        if lookback < 2:
+            return [], []
         swing_highs, swing_lows = [], []
         for i in range(lookback, len(df) - 1):
             start = max(0, i - lookback)
             end = min(len(df), i + lookback + 1)
-            if highs[i] == max(highs[start:end]):
+            window_high = max(highs[start:end])
+            window_low = min(lows[start:end])
+            if highs[i] == window_high:
                 if not swing_highs or swing_highs[-1][0] < i - 1:
                     swing_highs.append((i, highs[i]))
-            if lows[i] == min(lows[start:end]):
+            if lows[i] == window_low:
                 if not swing_lows or swing_lows[-1][0] < i - 1:
                     swing_lows.append((i, lows[i]))
         return swing_highs, swing_lows
@@ -112,8 +125,11 @@ class SignalGenerator:
         return "NEUTRAL"
 
     def _calculate_fvg(self, df):
-        if len(df) < 5: return 0
-        # Use last closed candles (df.iloc[-4], -3, -2) to prevent false signals from unclosed candle fluctuations
+        # Require at least 4 candles so the 3-candle window (-4, -3, -2) is available
+        # and we never index into a too-short frame.
+        if len(df) < 4: return 0
+        # Use last closed candles (df.iloc[-4], -3, -2) to prevent false signals from
+        # the unclosed forming candle's fluctuating high/low.
         c1, c2, c3 = df.iloc[-4], df.iloc[-3], df.iloc[-2]
         threshold = 0.0005 * df['close'].iloc[-1]
         # Bullish FVG: Candle 3's low is strictly higher than Candle 1's high
