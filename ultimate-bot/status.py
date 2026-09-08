@@ -73,6 +73,7 @@ TUNING_KEYS = {
     "SYMBOL_REFRESH_INTERVAL", "DB_PATH", "CONTROL_FILE", "DISCORD_COOLDOWN",
     "LOG_LEVEL", "LOG_FILE", "HEALTH_CHECK_INTERVAL", "REST_WEIGHT_LIMIT",
     "ENTRY_TIMEOUT", "AUTO_LIQUIDATE_ORPHANS",
+    "BASE_ORDER_SIZE", "ORDER_TYPE",
 }
 
 
@@ -1185,6 +1186,23 @@ def start_web_server(port, env_config, db_path):
                     return
                 env_path = os.path.abspath(".env")
                 applied = apply_env_updates(env_path, updates)
+
+                # Safety: if the pushed config would switch the engine from paper to live
+                # trading without valid auth credentials, abort the push so a PM2 reload
+                # cannot leave the engine in a boot-failure state.
+                if "PAPER_TRADE" in updates:
+                    new_paper = str(updates["PAPER_TRADE"]).lower() == "true"
+                    if not new_paper:
+                        tentative = dict(env_config)
+                        tentative.update(updates)
+                        api_key = str(tentative.get("BINANCE_API_KEY", "")).strip()
+                        api_secret = str(tentative.get("BINANCE_API_SECRET", "")).strip()
+                        private_key_path = str(tentative.get("BINANCE_PRIVATE_KEY_PATH", "")).strip()
+                        has_auth = bool(api_key and (api_secret or (private_key_path and os.path.exists(private_key_path))))
+                        if not has_auth:
+                            self._send_json({"ok": False, "message": "Cannot switch PAPER_TRADE=false: no valid BINANCE_API_KEY + secret/key path found in the pushed config."}, status=400)
+                            return
+
                 result = {"ok": True, "applied": applied, "count": len(applied)}
                 if applied and shutil.which("pm2"):
                     try:
@@ -1201,10 +1219,10 @@ def start_web_server(port, env_config, db_path):
                         "attempted": False,
                         "hint": "pm2 not detected — run 'pm2 reload ultimate-bot' (or restart the engine) to apply."
                     }
-                # Do NOT clear a pending close command when a config push happens. A
-                # pending close_all / close_symbol that is still retrying rejected exits
-                # must survive the .env/Pm2 reload so the operator's emergency request is
-                # not silently dropped mid-liquidation.
+                # Do NOT touch the engine control file (pause/close_all/close_symbol)
+                # when a config push happens. A pending close command that is still
+                # retrying rejected exits must survive the .env/PM2 reload so the
+                # operator's emergency request is not silently dropped mid-liquidation.
                 self._send_json(result)
                 return
 

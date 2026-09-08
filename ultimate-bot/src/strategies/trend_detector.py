@@ -89,7 +89,7 @@ class TrendDetector:
             return self.config["STATIC_SYMBOLS"]
         scored = self._calculate_z_scores(detailed)
         scored = await self._apply_correlation_penalty(scored)
-        scored.sort(key=lambda x: x["final_score"], reverse=True)
+        scored.sort(key=lambda x: x.get("final_score", 0.0), reverse=True)
         self.last_scored = scored
         return [item["symbol"] for item in scored[:self.config["MAX_SYMBOLS"]]]
 

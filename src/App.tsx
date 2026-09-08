@@ -1262,7 +1262,9 @@ export default function App() {
   // Keep runTickRef synchronized
   useEffect(() => {
     runTickRef.current = runTick;
-  }, [runTick]);    // Main Bot Tick Loop
+  }, [runTick]);
+
+  // Main Bot Tick Loop
   useEffect(() => {
     if (!isRunning) return;
 

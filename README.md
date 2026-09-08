@@ -8,10 +8,10 @@ A production-grade **Binance Spot** trading engine with **market-only execution*
 │   ├── status.py          # CLI dashboard + embedded web monitor / control API
 │   ├── config.py          # .env loader, presets, boot-time validation
 │   ├── ecosystem.config.js# PM2: runs engine AND web monitor
+│   ├── .env.example       # Annotated template for every config key
 │   └── src/               # exchange / strategy / risk / trade / database / reporting modules
 ├── src/                   # React + Vite web dashboard (Strategy Simulator + VPS ops center)
-├── generate_bot.py        # Generates a deployable copy of ultimate-bot/ from the audited tree
-└── metadata.json / .env.example  # Applet metadata & host template
+└── metadata.json          # Applet metadata
 ```
 
 Full documentation and step-by-step Debian 13 VPS instructions live in **[ultimate-bot/README.md](./ultimate-bot/README.md)**.
