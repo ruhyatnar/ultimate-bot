@@ -305,6 +305,23 @@ class TradeLogic:
         min_tp_dist = entry_price * self.config["MIN_TP_PERCENT"]
         if take_profit - entry_price < min_tp_dist:
             take_profit = entry_price + min_tp_dist
+
+        # R:R gate (professional filter): reject entries whose reward does not
+        # justify the risk. After the MIN_TP_PERCENT bump above, a tiny ATR could
+        # otherwise produce a TP barely beyond the stop — a trade with negative
+        # expectancy after fees.
+        sl_dist = entry_price - stop_price
+        tp_dist = take_profit - entry_price
+        min_rr = float(self.config.get("MIN_RISK_REWARD", 1.5))
+        if sl_dist <= 0 or tp_dist / sl_dist < min_rr:
+            self.logger.info(
+                f"{symbol}: entry rejected by R:R gate (TP/SL = {tp_dist / sl_dist if sl_dist > 0 else 0:.2f} < {min_rr}). "
+                f"Widening to minimum R:R."
+            )
+            if sl_dist > 0:
+                take_profit = entry_price + sl_dist * min_rr
+            else:
+                return
         side = "BUY"
 
         # Hard cap total capital deployed (equity * BALANCE_USAGE_PERCENT).
@@ -345,6 +362,10 @@ class TradeLogic:
                         min_tp_dist = entry_price * self.config["MIN_TP_PERCENT"]
                         if take_profit - entry_price < min_tp_dist:
                             take_profit = entry_price + min_tp_dist
+                        # Keep the R:R gate consistent after the fill-price re-anchor.
+                        sl_dist = entry_price - stop_price
+                        if sl_dist > 0 and (take_profit - entry_price) / sl_dist < min_rr:
+                            take_profit = entry_price + sl_dist * min_rr
                 except Exception as e:
                     self.logger.warning(f"Could not fetch avg fill price: {e}")
 
@@ -364,7 +385,9 @@ class TradeLogic:
             "symbol": symbol, "entry_price": entry_price, "side": side, "quantity": qty,
             "entry_time": time.time(), "stop_price": stop_price, "take_profit": take_profit,
             "atr": atr, "trailing_active": False, "trailing_stop": stop_price,
-            "breakeven_activated": False, "order_id": order_id
+            "breakeven_activated": False, "order_id": order_id,
+            "initial_qty": qty,
+            "scale_out_done": False,
         }
         self.active_trades[symbol] = trade
         await self.db.save_active_trade(trade)
@@ -389,6 +412,23 @@ class TradeLogic:
                     self.last_atr_update[symbol] = now
 
         if trade["side"] == "BUY":
+            # Scale-out (professional trade management): once price travels 1R
+            # (the initial stop distance) in favor, sell a fixed fraction (50%)
+            # to bank a partial profit, then trail the runner risk-free. This is
+            # the standard "take money off the table" discipline that converts
+            # a marginal raw win-rate into a positive expectancy curve.
+            if (
+                self.config.get("SCALE_OUT_ENABLED", True)
+                and not trade.get("scale_out_done", False)
+                and trade.get("initial_qty")
+                and trade["quantity"] > 0
+            ):
+                risk_per_unit = trade["entry_price"] - trade["stop_price"]
+                r_multiple = (price - trade["entry_price"]) / risk_per_unit if risk_per_unit > 0 else 0.0
+                if r_multiple >= float(self.config.get("SCALE_OUT_R_MULTIPLE", 1.0)):
+                    scale_qty = trade["quantity"] * float(self.config.get("SCALE_OUT_FRACTION", 0.5))
+                    await self._scale_out(symbol, trade, scale_qty)
+
             # Gap-breach protection: compare against bar LOWS/HIGHS, not just the
             # current tick. A tick-based check alone misses violent wicks that spike
             # through the stop between SIGNAL_INTERVAL polls and bounce back — the #1
@@ -449,6 +489,82 @@ class TradeLogic:
 
         if int(time.time()) % 30 == 0:
             await self.db.save_active_trade(trade)
+
+    async def _scale_out(self, symbol, trade, scale_qty):
+        """Sell a fraction of the position at +1R and mark the trade as scaled out.
+
+        The realized PnL of the partial leg is recorded like any other exit; the
+        remaining "runner" keeps its stop (which the breakeven/trailing logic will
+        ratchet up) and rides toward the full take-profit. If the scale-out order
+        fails, the flag stays False and it retries on the next cycle — never at the
+        cost of the protective stops, which are re-checked immediately after.
+        """
+        try:
+            filters = await self.rest.get_filters(symbol)
+            step_size = float(filters.get("LOT_SIZE", {}).get("stepSize", "0.000001"))
+            min_qty = float(filters.get("LOT_SIZE", {}).get("minQty", "0.00001"))
+            min_notional = float(filters.get("NOTIONAL", filters.get("MIN_NOTIONAL", {})).get("minNotional", 5.0))
+        except Exception:
+            step_size, min_qty, min_notional = 0.000001, 0.00001, 5.0
+
+        price = trade.get("entry_price", 0.0)
+        try:
+            price = await self.ws_stream.get_current_price(symbol) or price
+        except Exception:
+            pass
+
+        scale_qty = (int(scale_qty / step_size)) * step_size if step_size > 0 else scale_qty
+        runner_qty = trade["quantity"] - scale_qty
+        # Never scale out into dust: the runner must stay marketable, otherwise a
+        # later full exit would be below minNotional and rejected on Binance.
+        if scale_qty < min_qty or runner_qty * price < min_notional:
+            trade["scale_out_done"] = True  # position too small to split — manage as one unit
+            self.logger.debug(f"{symbol}: position too small for scale-out split; managing as single unit.")
+            return
+
+        order_id = await self.order_mgr.place_market_order(symbol, "SELL", scale_qty)
+        if order_id is None:
+            self.logger.warning(f"{symbol}: scale-out order rejected; will retry next cycle.")
+            return
+        filled, executed_qty = await self.order_mgr.wait_for_fill(symbol, order_id, timeout=10)
+        if not filled or executed_qty <= 0:
+            self.logger.warning(f"{symbol}: scale-out order {order_id} not filled; will retry next cycle.")
+            return
+
+        fill_price = price
+        if not self.config["PAPER_TRADE"]:
+            try:
+                order_info = await self.rest.get_order(symbol, order_id)
+                avg = float(order_info.get("avgPrice", 0) or 0)
+                if avg > 0: fill_price = avg
+            except Exception:
+                pass
+
+        # Net PnL for the scaled-out leg (entry side was already fee-deducted at entry)
+        fee_rate = 0.001
+        gross = (fill_price - trade["entry_price"]) * executed_qty
+        fees = (trade["entry_price"] * executed_qty + fill_price * executed_qty) * fee_rate
+        pnl = gross - fees
+
+        trade["quantity"] = max(0.0, trade["quantity"] - executed_qty)
+        trade["scale_out_done"] = True
+        # After banking 1R, the runner is effectively risk-free: lock breakeven
+        # immediately instead of waiting for the +1% trigger.
+        be_price = trade["entry_price"] * 1.0025
+        if be_price > trade["stop_price"]:
+            trade["stop_price"] = be_price
+        if be_price > trade.get("trailing_stop", 0):
+            trade["trailing_stop"] = be_price
+        trade["breakeven_activated"] = True
+
+        await self.db.update_order_status(order_id, "CANCELED", executed_qty, fill_price, profit_loss=pnl)
+        await self.db.save_active_trade(trade)
+        await self.risk_mgr.update_trade_result(pnl, symbol)
+        await self.webhook.send(
+            f"💰 SCALE-OUT {symbol}: sold {executed_qty:.6f} @ {fill_price:.4f} (+{pnl:+.2f} USDT net). "
+            f"Runner {trade['quantity']:.6f} rides with stop {trade['stop_price']:.4f}."
+        )
+        self.logger.info(f"Scale-out executed for {symbol}: {executed_qty} @ {fill_price:.4f}, net {pnl:+.2f} USDT.")
 
     async def _calculate_atr_from_klines(self, klines):
         if not klines: return 0

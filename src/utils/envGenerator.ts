@@ -65,6 +65,14 @@ COOLDOWN_WIN=${config.cooldownWin}
 MAX_SLIPPAGE_PERCENT=0.5
 MIN_TP_PERCENT=0.005
 
+# --- Risk Model & Trade Management ---
+# 1% fixed-fractional risk per trade (qty sized from entry-to-stop distance)
+RISK_PER_TRADE=0.01
+MIN_RISK_REWARD=1.5
+SCALE_OUT_ENABLED=true
+SCALE_OUT_R_MULTIPLE=1.0
+SCALE_OUT_FRACTION=0.5
+
 # --- Symbols Configuration ---
 DYNAMIC_SYMBOLS=${config.dynamicSymbols}
 MAX_SYMBOLS=${config.maxSymbols}

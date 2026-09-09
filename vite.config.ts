@@ -38,6 +38,14 @@ export default defineConfig(() => {
       hmr: process.env.DISABLE_HMR !== 'true',
       // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      fs: {
+        // botFiles.ts raw-imports files from ultimate-bot/ (e.g. .env.example for
+        // the Code Explorer). Vite's default deny list blocks every .env* file in
+        // dev mode, so explicitly allow the bot source tree — it contains no real
+        // secrets (only .env.example, which is a public template).
+        allow: [path.resolve(__dirname, '.'), path.resolve(__dirname, 'ultimate-bot')],
+        deny: [],
+      },
     },
   };
 });

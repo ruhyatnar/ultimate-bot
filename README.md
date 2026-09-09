@@ -54,14 +54,22 @@ cat keys/public_key.pem
 cp .env.example .env
 nano .env
 
-# 5. Launch engine + web monitor under PM2 supervision
+# 5. Build the React dashboard (run from the REPO ROOT, not ultimate-bot/)
+cd ..
+npm install
+npm run build        # outputs to ./dist at the repo root
+
+# 6. Launch engine + web monitor under PM2 supervision (run from ultimate-bot/)
+cd ultimate-bot
 pm2 start ecosystem.config.cjs
 pm2 save
 
-# 6. Monitor in real time
+# 7. Monitor in real time
 ./venv/bin/python3 status.py --watch        # terminal dashboard
 ./venv/bin/python3 status.py --web 3000     # web monitor / API (http://YOUR_VPS_IP:3000)
 ```
+
+> **Which folder?** The repo has two layers: the **repo root** is the React dashboard project (npm/vite) — `npm run build`/`npm run dev` run there and emit `dist/`. The **`ultimate-bot/` folder** is the Python trading engine — venv, `.env`, `main.py`, `status.py` and PM2 all live and run there. `status.py --web` automatically picks up the compiled UI from `../dist`, so you never need `npx serve` or a second server.
 
 ---
 
@@ -90,6 +98,7 @@ A **Strategy Simulator** sandbox (forward-tested paper trading with fee-accurate
 - Ed25519-signed REST **and** WebSocket API order routing (HMAC secret supported as a fallback).
 - Public WebSocket price stream with automatic REST fallback and gap-breach stop protection on bar lows.
 - Net PnL always deducts 0.1% taker fees per leg; fee-aware breakeven lock at entry +0.25%.
+- **Professional risk model**: fixed-fractional 1% risk-per-trade sizing (entry→stop distance), regime-alignment gate (never long a downtrend), minimum 1.5 R:R entry filter, CVD noise floor, and +1R partial scale-out with a breakeven-locked runner.
 - Daily drawdown circuit breaker, per-symbol win/loss streak cooldowns, exchange position reconciliation, and single-instance locking.
 - WAL-mode SQLite with a batched async write queue and read-only monitor access.
 - PM2 supervision of both the engine and the web monitor (`ecosystem.config.cjs`).

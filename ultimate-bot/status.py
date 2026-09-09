@@ -98,6 +98,8 @@ TUNING_KEYS = {
     "LOG_LEVEL", "LOG_FILE", "HEALTH_CHECK_INTERVAL", "REST_WEIGHT_LIMIT",
     "ENTRY_TIMEOUT", "AUTO_LIQUIDATE_ORPHANS",
     "BASE_ORDER_SIZE", "ORDER_TYPE",
+    "RISK_PER_TRADE", "MIN_RISK_REWARD",
+    "SCALE_OUT_ENABLED", "SCALE_OUT_R_MULTIPLE", "SCALE_OUT_FRACTION",
 }
 
 
@@ -1095,12 +1097,25 @@ def get_standalone_html():
 
 
 def start_web_server(port, env_config, db_path):
-    dist_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "dist"))
-    if not (os.path.isdir(dist_dir) and os.path.isfile(os.path.join(dist_dir, "index.html"))):
-        alt_dist = os.path.abspath("dist")
-        if os.path.isdir(alt_dist) and os.path.isfile(os.path.join(alt_dist, "index.html")):
-            dist_dir = alt_dist
-    has_dist = os.path.isdir(dist_dir) and os.path.isfile(os.path.join(dist_dir, "index.html"))
+    # Compiled React dashboard lookup order:
+    #   1. ./dist          (if you copied/built it next to status.py)
+    #   2. ../dist         (the repo root — where `npm run build` actually outputs;
+    #                       PM2 runs status.py with cwd=ultimate-bot/, so this is
+    #                       the location that matters in production)
+    #   3. $PWD/dist       (fallback for ad-hoc runs from the repo root)
+    here = os.path.dirname(os.path.abspath(__file__))
+    dist_candidates = [
+        os.path.join(here, "dist"),
+        os.path.join(here, "..", "dist"),
+        os.path.abspath("dist"),
+    ]
+    dist_dir = ""
+    for cand in dist_candidates:
+        cand = os.path.abspath(cand)
+        if os.path.isdir(cand) and os.path.isfile(os.path.join(cand, "index.html")):
+            dist_dir = cand
+            break
+    has_dist = bool(dist_dir) and os.path.isfile(os.path.join(dist_dir, "index.html"))
 
     class CustomHandler(SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):

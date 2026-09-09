@@ -2,9 +2,16 @@ import os
 from pathlib import Path
 
 PRESETS = {
-    "scalping": {"TIMEFRAME":"1m","MTF_TIMEFRAME":"15m","ATR_PERIOD":10,"ATR_MULTIPLIER_SL":0.8,"ATR_MULTIPLIER_TP":1.2,"TRAILING_STOP_ACTIVATE":0.005,"TRAILING_STOP_CALLBACK":0.002,"SWING_LOOKBACK":3,"MAX_HOLD_TIME":3600},
-    "day": {"TIMEFRAME":"5m","MTF_TIMEFRAME":"1h","ATR_PERIOD":14,"ATR_MULTIPLIER_SL":1.5,"ATR_MULTIPLIER_TP":2.5,"TRAILING_STOP_ACTIVATE":0.015,"TRAILING_STOP_CALLBACK":0.005,"SWING_LOOKBACK":5,"MAX_HOLD_TIME":28800},
-    "swing": {"TIMEFRAME":"15m","MTF_TIMEFRAME":"4h","ATR_PERIOD":20,"ATR_MULTIPLIER_SL":2.0,"ATR_MULTIPLIER_TP":4.0,"TRAILING_STOP_ACTIVATE":0.025,"TRAILING_STOP_CALLBACK":0.01,"SWING_LOOKBACK":8,"MAX_HOLD_TIME":86400}
+    # Scalping: 1m entries, tight 1.0x/2.0x ATR bracket (R:R 2.0), fast trailing.
+    # Tight stops demand HTF alignment — confluence gate stays at 4/5.
+    "scalping": {"TIMEFRAME":"1m","MTF_TIMEFRAME":"15m","ATR_PERIOD":10,"ATR_MULTIPLIER_SL":1.0,"ATR_MULTIPLIER_TP":2.0,"TRAILING_STOP_ACTIVATE":0.005,"TRAILING_STOP_CALLBACK":0.002,"SWING_LOOKBACK":3,"MAX_HOLD_TIME":3600},
+    # Day trading: 5m entries, 1.2x SL / 2.4x TP (R:R 2.0) — the professional
+    # standard. Wide-enough stop survives normal 5m noise; TP keeps expectancy
+    # positive even at a 40-45% raw win rate once fees are netted.
+    "day": {"TIMEFRAME":"5m","MTF_TIMEFRAME":"1h","ATR_PERIOD":14,"ATR_MULTIPLIER_SL":1.2,"ATR_MULTIPLIER_TP":2.4,"TRAILING_STOP_ACTIVATE":0.015,"TRAILING_STOP_CALLBACK":0.005,"SWING_LOOKBACK":5,"MAX_HOLD_TIME":28800},
+    # Swing: 15m entries, 2.0x SL / 4.0x TP (R:R 2.0), trailing later (3%) so
+    # multi-day runners keep their room.
+    "swing": {"TIMEFRAME":"15m","MTF_TIMEFRAME":"4h","ATR_PERIOD":20,"ATR_MULTIPLIER_SL":2.0,"ATR_MULTIPLIER_TP":4.0,"TRAILING_STOP_ACTIVATE":0.03,"TRAILING_STOP_CALLBACK":0.012,"SWING_LOOKBACK":8,"MAX_HOLD_TIME":86400}
 }
 
 def load_config():
@@ -42,6 +49,11 @@ def load_config():
         "BALANCE_USAGE_PERCENT": float(os.getenv("BALANCE_USAGE_PERCENT", 0.5)),
         "MAX_SYMBOL_ALLOCATION_PERCENT": float(os.getenv("MAX_SYMBOL_ALLOCATION_PERCENT", 0.2)),
         "MAX_HOLD_TIME": int(os.getenv("MAX_HOLD_TIME", preset["MAX_HOLD_TIME"])),
+        "RISK_PER_TRADE": float(os.getenv("RISK_PER_TRADE", 0.01)),
+        "MIN_RISK_REWARD": float(os.getenv("MIN_RISK_REWARD", 1.5)),
+        "SCALE_OUT_ENABLED": os.getenv("SCALE_OUT_ENABLED", "true").lower() == "true",
+        "SCALE_OUT_R_MULTIPLE": float(os.getenv("SCALE_OUT_R_MULTIPLE", 1.0)),
+        "SCALE_OUT_FRACTION": float(os.getenv("SCALE_OUT_FRACTION", 0.5)),
         "MAX_DAILY_DRAWDOWN": float(os.getenv("MAX_DAILY_DRAWDOWN", 0.05)),
         "MAX_LOSS_STREAK": int(os.getenv("MAX_LOSS_STREAK", 3)),
         "MAX_WIN_STREAK": int(os.getenv("MAX_WIN_STREAK", 5)),
@@ -151,6 +163,16 @@ def load_config():
         raise ValueError("SWING_LOOKBACK must be at least 2.")
     if not isinstance(config["MAX_HOLD_TIME"], int) or config["MAX_HOLD_TIME"] < 60:
         raise ValueError("MAX_HOLD_TIME must be at least 60 seconds.")
+    if not isinstance(config["RISK_PER_TRADE"], (int, float)) or not (0 < config["RISK_PER_TRADE"] <= 0.1):
+        raise ValueError("RISK_PER_TRADE must be between 0 (exclusive) and 0.1 (10% of equity per trade — do not go higher).")
+    if not isinstance(config["MIN_RISK_REWARD"], (int, float)) or config["MIN_RISK_REWARD"] < 1.0:
+        raise ValueError("MIN_RISK_REWARD must be at least 1.0 (TP distance vs SL distance).")
+    if not (0 < config["SCALE_OUT_FRACTION"] < 1):
+        raise ValueError("SCALE_OUT_FRACTION must be between 0 (exclusive) and 1 (exclusive).")
+    if config["SCALE_OUT_R_MULTIPLE"] <= 0:
+        raise ValueError("SCALE_OUT_R_MULTIPLE must be positive (1.0 = take profit at 1x the stop distance).")
+    if config["SCALE_OUT_R_MULTIPLE"] >= config["ATR_MULTIPLIER_TP"] / config["ATR_MULTIPLIER_SL"]:
+        raise ValueError("SCALE_OUT_R_MULTIPLE must be below the preset's full R:R (TP/SL multiple) so the runner leg still has room.")
     if not config["STATIC_SYMBOLS"] and not config["DYNAMIC_SYMBOLS"]:
         raise ValueError("At least one symbol must be provided.")
     if not (0 < config["BALANCE_USAGE_PERCENT"] <= 1):

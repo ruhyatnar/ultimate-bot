@@ -230,6 +230,22 @@ MAX_SLIPPAGE_PERCENT=0.5    # skip entry if price moved more than this
 MIN_TP_PERCENT=0.005        # take-profit never closer than this fraction
 ```
 
+Two professional filters sit on top of the raw confluence score:
+- **Regime alignment** — a BUY is blocked outright when the MTF trend is DOWN (and vice versa), so the engine never longs into a downtrend just because 4 micro-factors aligned.
+- **R:R gate (`MIN_RISK_REWARD`, default 1.5)** — entries whose TP distance is less than the configured multiple of the SL distance are widened (or skipped) before the order is placed.
+- **CVD noise floor** — the volume-delta factor only counts when taker flow shows at least a 55/45 directional skew, so ±2% imbalances no longer score as full confluence.
+
+### Risk model & trade management
+```ini
+RISK_PER_TRADE=0.01         # 1% of equity risked per trade (entry→stop distance)
+MIN_RISK_REWARD=1.5         # TP distance must be >= 1.5x the SL distance
+SCALE_OUT_ENABLED=true      # bank partial profit at +1R
+SCALE_OUT_R_MULTIPLE=1.0    # trigger the scale-out at 1x the initial stop distance
+SCALE_OUT_FRACTION=0.5      # sell 50% of the position at the trigger
+```
+
+Position sizing uses **fixed-fractional risk**: `qty = (equity × RISK_PER_TRADE) ÷ (entry − stop)`. A wide 2×ATR swing stop and a tight scalp stop therefore both lose exactly 1% of equity when hit — the notional caps (`BALANCE_USAGE_PERCENT`, `MAX_SYMBOL_ALLOCATION_PERCENT`) remain as secondary ceilings. If the risk-based size falls below the exchange minimum, the trade is skipped rather than up-sized past the risk budget. After a scale-out fires, breakeven (fees covered) locks immediately on the runner.
+
 ### Symbols
 ```ini
 STATIC_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT
@@ -391,6 +407,9 @@ Notes:
 11. **Order-Quantity Edge Cases** — quantity strings are never allowed to become empty (which would send a blank `quantity` and get rejected), and `Decimal` quantization guards against floating-point step-size artifacts.
 12. **WebSocket Timeouts Are Retryable** — the authenticated WS-API client now retries the per-request `recv()` up to ~100 s before treating a response as lost, so momentary stalls don't abort orders.
 13. **Kline Cache Coherence** — completed kline updates are applied atomically so the tick price, ATR refresh, and gap-breach checks never see a partially-written candle.
+14. **Fixed-Fractional Risk Sizing** — every entry is sized from the entry-to-stop distance (`RISK_PER_TRADE`, default 1% of equity), so stop width can never silently inflate per-trade risk; notional caps act only as secondary ceilings.
+15. **Regime Alignment & R:R Gate** — BUYs are blocked when the MTF trend is DOWN (no knife-catching), and entries below `MIN_RISK_REWARD` reward-to-risk are widened or skipped.
+16. **Scale-Out Discipline** — 50% of the position is banked at +1R (`SCALE_OUT_*`), breakeven locks immediately on the runner, and the remainder rides to the full take-profit — converting marginal win rates into positive expectancy.
 
 ---
 

@@ -78,6 +78,19 @@ class SignalGenerator:
 
         threshold = self.config["SIGNAL_THRESHOLD"]
         self.logger.debug(f"{symbol}: htf={htf_trend}, bos={bos}, fvg={fvg}, delta={delta}, poc={poc}, bullish={bullish}, bearish={bearish}, threshold={threshold}")
+
+        # Regime alignment gate (professional filter): never catch falling knives.
+        # A BUY requires the higher-timeframe trend to be UP or at worst NEUTRAL —
+        # a 4/5 bullish score while the HTF trend is DOWN is exactly the setup that
+        # bleeds accounts (long into distribution). The same applies mirrored for
+        # shorts, keeping the logic symmetric even though spot mode is long-only.
+        if bullish >= threshold and htf_trend == "DOWN":
+            self.logger.debug(f"{symbol}: BUY score {bullish}>={threshold} blocked — HTF trend is DOWN (regime misalignment).")
+            return "NEUTRAL", current_atr
+        if bearish >= threshold and htf_trend == "UP":
+            self.logger.debug(f"{symbol}: SELL score {bearish}>={threshold} blocked — HTF trend is UP (regime misalignment).")
+            return "NEUTRAL", current_atr
+
         if bullish >= threshold: return "BUY", current_atr
         elif bearish >= threshold: return "SELL", current_atr
         return "NEUTRAL", current_atr
@@ -139,10 +152,24 @@ class SignalGenerator:
         return 0
 
     def _calculate_cvd(self, df):
+        """Normalized CVD direction with a noise floor.
+
+        A raw taker-buy minus taker-sell sum treats a ±0.1% imbalance the same as a
+        strong 2% one-way flow, giving low-quality confluence points. Normalizing by
+        total quoted volume and requiring a minimum directional share before
+        counting the factor keeps this factor meaningful.
+        """
         if 'taker_buy_quote' not in df.columns or 'quote_volume' not in df.columns: return 0.0
-        delta = df['taker_buy_quote'] - (df['quote_volume'] - df['taker_buy_quote'])
-        val = delta.rolling(20, min_periods=1).sum().iloc[-1]
-        return float(val) if not pd.isna(val) else 0.0
+        recent = df.iloc[-20:]
+        if len(recent) < 10: return 0.0
+        buy_vol = float(recent['taker_buy_quote'].sum())
+        total_vol = float(recent['quote_volume'].sum())
+        if total_vol <= 0: return 0.0
+        buy_share = buy_vol / total_vol  # 0.5 = perfectly balanced flow
+        # Require at least a 55/45 directional skew before counting as confluence.
+        if buy_share >= 0.55: return 1.0
+        if buy_share <= 0.45: return -1.0
+        return 0.0
 
     def _calculate_poc(self, df):
         recent = df.iloc[-20:]

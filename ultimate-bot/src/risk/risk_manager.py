@@ -179,12 +179,44 @@ class RiskManager:
             await self.save_state()
 
     async def calculate_position_size(self, symbol, entry_price, stop_price):
+        """Fixed-fractional risk position sizing (the professional standard).
+
+        Primary formula: qty = (equity * RISK_PER_TRADE) / (entry - stop).
+        This makes every trade risk the same fixed fraction of equity (default 1%)
+        regardless of how wide the ATR stop is — a 2x-ATR swing stop and a 1x-ATR
+        scalp stop both lose exactly RISK_PER_TRADE of equity when hit.
+
+        The notional allocation cap (BALANCE_USAGE_PERCENT / per-symbol cap) is kept
+        as a SECONDARY ceiling so sizing can never exceed portfolio limits — but it
+        no longer blindly decides the size, which previously allowed a wide stop to
+        silently risk 4-6% of equity per trade.
+        """
         if self.total_equity <= 0 or entry_price <= 0:
             self.logger.warning(f"Position sizing skipped for {symbol}: total_equity={self.total_equity}, entry_price={entry_price}")
             return 0.0
+
+        # --- Primary: risk-based sizing ---
+        stop_dist = entry_price - stop_price
+        risk_per_unit = stop_dist if stop_dist > 0 else 0.0
+        if risk_per_unit <= 0:
+            self.logger.warning(f"Position sizing skipped for {symbol}: stop_price {stop_price} >= entry_price {entry_price} (no defined risk).")
+            return 0.0
+        risk_amount = float(self.total_equity) * float(self.config.get("RISK_PER_TRADE", 0.01))
+        risk_qty = risk_amount / risk_per_unit
+
+        # --- Secondary ceiling: portfolio notional caps ---
         allocation = Decimal(str(self.total_equity)) * Decimal(str(self.config["BALANCE_USAGE_PERCENT"]))
         max_symbol_alloc = Decimal(str(self.total_equity)) * Decimal(str(self.config["MAX_SYMBOL_ALLOCATION_PERCENT"]))
         allocation = min(allocation, max_symbol_alloc)
+        alloc_qty = allocation / Decimal(str(entry_price))
+
+        # Take the more conservative of the two sizings.
+        qty_dec = Decimal(str(risk_qty))
+        if alloc_qty < qty_dec:
+            qty_dec = alloc_qty
+            self.logger.debug(
+                f"{symbol}: notional cap limited size to {float(alloc_qty):.6f} (risk-based size was {risk_qty:.6f})."
+            )
 
         # Safeguard: Never allocate more than available free quote currency (e.g. USDT)
         free_quote = None
@@ -223,6 +255,16 @@ class RiskManager:
                 self.logger.warning(f"Total equity {self.total_equity} is less than minNotional {min_notional} for {symbol}.")
                 return 0.0
 
+        # Floor at minQty, but never let the floor override the risk cap: if the
+        # risk-based size steps below the exchange minimum, the trade cannot be
+        # taken safely at 1% risk — skipping is the professional move, not
+        # up-sizing to minNotional and blowing through the risk budget.
+        if qty_dec < min_qty:
+            self.logger.info(
+                f"{symbol}: risk-based size {float(qty_dec):.6f} is below exchange minQty {float(min_qty)}; entry skipped "
+                f"(risking minNotional would exceed the {self.config.get('RISK_PER_TRADE', 0.01)*100:.1f}% risk cap)."
+            )
+            return 0.0
         qty_dec = (qty_dec // step_size) * step_size
         qty_dec = max(qty_dec, min_qty)
         if "maxQty" in filters.get("LOT_SIZE", {}):
