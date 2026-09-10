@@ -40,7 +40,14 @@ class SignalGenerator:
         ltf_df = await self._get_cached_klines(symbol, self.config["TIMEFRAME"], 100)
         if htf_df is None or ltf_df is None:
             return "NEUTRAL", 0
+        return self.decide(htf_df, ltf_df, symbol=symbol)
 
+    def decide(self, htf_df, ltf_df, symbol: str = ""):
+        """Pure decision core: score the confluence factors on the given frames
+        and return (signal, current_atr). Shared verbatim by the LIVE engine
+        (via generate_signal) and the BACKTEST bar-replay (backtest.py) — one
+        strategy definition, zero drift between what is backtested and what
+        trades real money."""
         atr = self._calculate_atr(ltf_df)
         current_atr = atr.iloc[-1] if not pd.isna(atr.iloc[-1]) and atr.iloc[-1] > 0 else ltf_df['close'].iloc[-1] * 0.001
 
@@ -63,6 +70,7 @@ class SignalGenerator:
         fvg = self._calculate_fvg(ltf_df)
         delta = self._calculate_cvd(ltf_df)
         poc = self._calculate_poc(ltf_df)
+        pct_b = self._calculate_bollinger_pct_b(ltf_df)
 
         bullish, bearish = 0, 0
         if htf_trend == "UP": bullish += 1
@@ -89,6 +97,19 @@ class SignalGenerator:
             return "NEUTRAL", current_atr
         if bearish >= threshold and htf_trend == "UP":
             self.logger.debug(f"{symbol}: SELL score {bearish}>={threshold} blocked — HTF trend is UP (regime misalignment).")
+            return "NEUTRAL", current_atr
+
+        # Bollinger overextension gate: all five confluence factors are momentum/
+        # continuation signals, so the stack's blind spot is buying a vertical,
+        # overextended candle that mean-reverts into the ATR stop before TP fires.
+        # A %B reading >= BB_UPPER_PCT_B (default 0.95) means price closed at/above
+        # the upper band — statistically stretched. Skipping those entries protects
+        # the expectancy without touching SIGNAL_THRESHOLD semantics (1-5).
+        if self.config.get("BB_STRETCH_GATE_ENABLED", True) and bullish >= threshold and pct_b >= float(self.config.get("BB_UPPER_PCT_B", 0.95)):
+            self.logger.debug(
+                f"{symbol}: BUY score {bullish}>={threshold} blocked — Bollinger overextended "
+                f"(%B={pct_b:.2f} >= {self.config.get('BB_UPPER_PCT_B', 0.95)}); waiting for a pullback entry."
+            )
             return "NEUTRAL", current_atr
 
         if bullish >= threshold: return "BUY", current_atr
@@ -150,6 +171,39 @@ class SignalGenerator:
         # Bearish FVG: Candle 3's high is strictly lower than Candle 1's low
         if c3['high'] < c1['low'] and (c1['low'] - c3['high']) > threshold: return -1
         return 0
+
+    def _calculate_bollinger_pct_b(self, df):
+        """Bollinger Bands %B position gauge: (close − lower) / (upper − lower).
+
+        0.5 = at the midline, 1.0 = at the upper band, >1.0 = above it. Bands are
+        computed from BB_PERIOD CLOSED candles (stable, no forming-candle noise)
+        but the position is evaluated against the LIVE close — entries execute at
+        the live price, so an intrabar spike into the upper band must be caught,
+        not just one that already closed there. Returns 0.5 (midline — never
+        blocks) when there is not enough data or the band width collapses, so the
+        gate only ever blocks genuinely stretched entries.
+        """
+        try:
+            period = int(self.config.get("BB_PERIOD", 20))
+            std_dev = float(self.config.get("BB_STD_DEV", 2.0))
+            closed = df.iloc[:-1]  # bands exclude the unclosed forming candle
+            if len(closed) < period:
+                return 0.5
+            window = closed['close'].iloc[-period:]
+            mid = float(window.mean())
+            sd = float(window.std(ddof=0))
+            if not np.isfinite(sd) or sd <= 0:
+                return 0.5
+            upper = mid + std_dev * sd
+            lower = mid - std_dev * sd
+            width = upper - lower
+            if width <= 0:
+                return 0.5
+            close = float(df['close'].iloc[-1])  # live/forming close = entry price
+            return (close - lower) / width
+        except Exception as e:
+            self.logger.debug(f"Bollinger %B calculation failed: {e}")
+            return 0.5
 
     def _calculate_cvd(self, df):
         """Normalized CVD direction with a noise floor.

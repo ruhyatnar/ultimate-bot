@@ -89,6 +89,7 @@ async def main():
 
     error_handler = ErrorHandler(webhook)
 
+    background_tasks = []
     try:
         if not config["PAPER_TRADE"] and ws_api:
             try:

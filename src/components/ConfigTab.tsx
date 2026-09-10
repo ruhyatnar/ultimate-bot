@@ -226,6 +226,57 @@ export const ConfigTab: React.FC<ConfigTabProps> = ({
 
               <div>
                 <label className="font-semibold text-slate-200 block mb-1">
+                  Bollinger %B Gate ({config.bbUpperPctB})
+                </label>
+                <input
+                  type="number"
+                  step="0.05"
+                  min="0.5"
+                  max="1.5"
+                  value={config.bbUpperPctB}
+                  onChange={e => handleChange('bbUpperPctB', parseFloat(e.target.value))}
+                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 font-mono text-xs"
+                />
+                <p className="text-[10px] text-slate-500 mt-1">Blocks BUYs when Bollinger %B ≥ this level (0.95 = upper band stretch).</p>
+              </div>
+
+              <div>
+                <label className="font-semibold text-slate-200 block mb-1">
+                  Bollinger Period / StdDev ({config.bbPeriod} / {config.bbStdDev})
+                </label>
+                <div className="flex space-x-2">
+                  <input
+                    type="number"
+                    step="1"
+                    min="5"
+                    max="100"
+                    value={config.bbPeriod}
+                    onChange={e => handleChange('bbPeriod', parseInt(e.target.value, 10))}
+                    className="w-1/2 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 font-mono text-xs"
+                  />
+                  <input
+                    type="number"
+                    step="0.1"
+                    min="0.5"
+                    max="4.0"
+                    value={config.bbStdDev}
+                    onChange={e => handleChange('bbStdDev', parseFloat(e.target.value))}
+                    className="w-1/2 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 font-mono text-xs"
+                  />
+                </div>
+                <label className="flex items-center space-x-2 mt-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={config.bbStretchGateEnabled}
+                    onChange={e => handleChange('bbStretchGateEnabled', e.target.checked)}
+                    className="accent-amber-500"
+                  />
+                  <span className="text-[11px] text-slate-400">Enable Bollinger overextension gate</span>
+                </label>
+              </div>
+
+              <div>
+                <label className="font-semibold text-slate-200 block mb-1">
                   Trailing Activate ({(config.trailingStopActivate * 100).toFixed(1)}%)
                 </label>
                 <input

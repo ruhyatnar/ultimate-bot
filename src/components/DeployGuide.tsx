@@ -73,7 +73,7 @@ export const DeployGuide: React.FC = () => {
       id: 'step-8',
       title: '9. Monitor Mode C: Web Dashboard & Remote Browser UI',
       desc: 'Access your live dashboard from any browser using the built-in Python web server, PM2, or static React server.',
-      cmd: `# Single command serves BOTH the React dashboard AND the live API:\npython3 status.py --web 3000\n# (SPA fallback, gzip, ETag/304 caching, HTTP Range, keep-alive — full npx serve parity, no Node needed)\n\n# Automated 24/7 PM2 Supervision (Runs bot + web monitor together):\npm2 start ecosystem.config.cjs\npm2 save\n\n# Remote Access: Visit http://YOUR_VPS_IP:3000 in your browser\n# Or SSH Port Tunnel (run on your local PC): ssh -L 3000:localhost:3000 user@YOUR_VPS_IP`
+      cmd: `# Single command serves the React dashboard, the WebSocket API and the HTTP API:\npython3 status.py --web 3000\n# (React + WS realtime push on /ws + polling fallback, SPA fallback, gzip, ETag/304 caching, keep-alive — no Node needed)\n\n# Automated 24/7 PM2 Supervision (Runs bot + web monitor together):\npm2 start ecosystem.config.cjs\npm2 save\n\n# Remote Access: Visit http://YOUR_VPS_IP:3000 in your browser\n# Or SSH Port Tunnel (run on your local PC): ssh -L 3000:localhost:3000 user@YOUR_VPS_IP`
     }
   ];
 

@@ -13,6 +13,7 @@ import {
   PlayCircle
 } from 'lucide-react';
 import { VpsBotStatus } from '../types';
+import { WsTransport } from '../utils/vpsSocket';
 
 interface VpsConnectionBarProps {
   dataSource: 'vps' | 'simulator';
@@ -24,6 +25,7 @@ interface VpsConnectionBarProps {
   isPolling: boolean;
   controlPaused?: boolean;
   onToggleVpsPause?: () => void;
+  wsTransport?: WsTransport;
 }
 
 export const VpsConnectionBar: React.FC<VpsConnectionBarProps> = ({
@@ -35,7 +37,8 @@ export const VpsConnectionBar: React.FC<VpsConnectionBarProps> = ({
   onRefreshVps,
   isPolling,
   controlPaused = false,
-  onToggleVpsPause
+  onToggleVpsPause,
+  wsTransport = 'connecting'
 }) => {
   const [showConfigModal, setShowConfigModal] = useState<boolean>(false);
   const [inputUrl, setInputUrl] = useState<string>(vpsEndpoint);
@@ -134,6 +137,27 @@ export const VpsConnectionBar: React.FC<VpsConnectionBarProps> = ({
                   </span>
                 )}
               </div>
+
+              {/* Transport badge: realtime WebSocket push vs HTTP polling fallback */}
+              {dataSource === 'vps' && (
+                <span
+                  title={wsTransport === 'websocket'
+                    ? 'Realtime WebSocket push (ws://…/ws) — updates stream instantly from status.py'
+                    : wsTransport === 'polling'
+                      ? 'HTTP polling fallback (WebSocket unavailable or blocked)'
+                      : 'Negotiating WebSocket connection…'}
+                  className={`hidden md:inline-flex items-center space-x-1 px-2 py-0.5 rounded-full border font-medium ${
+                    wsTransport === 'websocket'
+                      ? 'text-cyan-300 bg-cyan-950/60 border-cyan-800/60'
+                      : wsTransport === 'polling'
+                        ? 'text-amber-300 bg-amber-950/60 border-amber-800/60'
+                        : 'text-slate-400 bg-slate-900 border-slate-800'
+                  }`}
+                >
+                  <span className={`w-2 h-2 rounded-full ${wsTransport === 'websocket' ? 'bg-cyan-400 animate-pulse' : 'bg-amber-400'}`} />
+                  <span>{wsTransport === 'websocket' ? 'WS LIVE' : wsTransport === 'polling' ? 'HTTP POLL' : 'WS…'}</span>
+                </span>
+              )}
 
               {/* Engine process badge */}
               <div className="hidden md:flex items-center space-x-1.5 text-slate-300 bg-slate-900 border border-slate-800 px-2 py-0.5 rounded-md">

@@ -14,6 +14,7 @@ import {
 } from './types';
 import { analyzeCandles } from './utils/technicalAnalysis';
 import { TAKER_FEE_RATE, MIN_NOTIONAL_USDT, BREAKEVEN_FEE_MULTIPLIER, effectiveAllocation, generateEnvString } from './utils/envGenerator';
+import { VpsSocket, WsTransport } from './utils/vpsSocket';
 import { Header } from './components/Header';
 import { VpsConnectionBar } from './components/VpsConnectionBar';
 import { LiveDashboard } from './components/LiveDashboard';
@@ -24,12 +25,15 @@ import { ConfigTab } from './components/ConfigTab';
 import { DeployGuide } from './components/DeployGuide';
 
 const PRESET_MAP: Record<StrategyPreset, Partial<BotConfig>> = {
+  // Values mirror ultimate-bot/config.py PRESETS exactly so the dashboard tunes
+  // the same strategy the engine runs (previously the UI presets contradicted
+  // the engine's — e.g. scalping 0.8/1.2 ATR here vs 1.0/2.0 on the engine).
   scalping: {
     timeframe: '1m',
     mtfTimeframe: '15m',
     atrPeriod: 10,
-    atrMultiplierSl: 0.8,
-    atrMultiplierTp: 1.2,
+    atrMultiplierSl: 1.0,
+    atrMultiplierTp: 2.0,
     trailingStopActivate: 0.005,
     trailingStopCallback: 0.002,
     swingLookback: 3,
@@ -39,8 +43,8 @@ const PRESET_MAP: Record<StrategyPreset, Partial<BotConfig>> = {
     timeframe: '5m',
     mtfTimeframe: '1h',
     atrPeriod: 14,
-    atrMultiplierSl: 1.5,
-    atrMultiplierTp: 2.5,
+    atrMultiplierSl: 3.0,
+    atrMultiplierTp: 3.5,
     trailingStopActivate: 0.015,
     trailingStopCallback: 0.005,
     swingLookback: 5,
@@ -52,8 +56,8 @@ const PRESET_MAP: Record<StrategyPreset, Partial<BotConfig>> = {
     atrPeriod: 20,
     atrMultiplierSl: 2.0,
     atrMultiplierTp: 4.0,
-    trailingStopActivate: 0.025,
-    trailingStopCallback: 0.01,
+    trailingStopActivate: 0.03,
+    trailingStopCallback: 0.012,
     swingLookback: 8,
     maxHoldTime: 86400
   }
@@ -64,18 +68,22 @@ const DEFAULT_CONFIG: BotConfig = {
   timeframe: '5m',
   mtfTimeframe: '1h',
   atrPeriod: 14,
-  atrMultiplierSl: 1.5,
-  atrMultiplierTp: 2.5,
+  atrMultiplierSl: 3.0,
+  atrMultiplierTp: 3.5,
   trailingStopActivate: 0.015,
   trailingStopCallback: 0.005,
   swingLookback: 5,
+  bbPeriod: 20,
+  bbStdDev: 2.0,
+  bbUpperPctB: 0.95,
+  bbStretchGateEnabled: true,
   maxHoldTime: 28800,
   signalThreshold: 4,
   signalInterval: 6,
   maxDailyDrawdown: 0.05,
   maxLossStreak: 3,
   maxWinStreak: 5,
-  cooldownLoss: 3600,
+  cooldownLoss: 10800,
   cooldownWin: 1800,
   balanceUsagePercent: 0.5,
   maxSymbolAllocationPercent: 0.2,
@@ -164,6 +172,9 @@ export default function App() {
     }
   });
   const [isPollingVps, setIsPollingVps] = useState<boolean>(false);
+  // Monitoring stack transport: 'websocket' = realtime /ws push from status.py,
+  // 'polling' = HTTP fallback (proxy blocked the upgrade or backend restarts).
+  const [wsTransport, setWsTransport] = useState<WsTransport>('connecting');
   const [vpsStatus, setVpsStatus] = useState<VpsBotStatus>({
     connected: false,
     endpoint: vpsEndpoint || (typeof window !== 'undefined' ? window.location.origin : ''),
@@ -176,6 +187,9 @@ export default function App() {
 
   const vpsStatusRef = useRef<VpsBotStatus>(vpsStatus);
   vpsStatusRef.current = vpsStatus;
+
+  const wsTransportRef = useRef<WsTransport>('connecting');
+  wsTransportRef.current = wsTransport;
 
   const [vpsPushResult, setVpsPushResult] = useState<PushResult | null>(null);
   const [vpsBalance, setVpsBalance] = useState<VpsBalanceData | null>(null);
@@ -265,6 +279,68 @@ export default function App() {
     };
     setLogs(prev => [...prev.slice(-300), newLog]);
   }, []);
+
+  // -----------------------------------------------------------------------
+  // Realtime WebSocket channel (React frontend + WS API + Python backend).
+  // status.py streams /api/status snapshots (1s) and engine log lines over
+  // ws://<host>/ws; HTTP polling below remains the automatic fallback.
+  // Handlers resolve through refs so reconnects never use stale closures.
+  // -----------------------------------------------------------------------
+  const applyVpsPayloadRef = useRef<(json: any, latency?: number) => void>(() => {});
+  const vpsEndpointRef = useRef<string>(vpsEndpoint);
+  vpsEndpointRef.current = vpsEndpoint;
+  const lastWsTransportRef = useRef<WsTransport>('connecting');
+  const vpsSocketRef = useRef<VpsSocket | null>(null);
+  if (typeof window !== 'undefined' && !vpsSocketRef.current) {
+    const seenWsLogs = new Set<string>();
+    vpsSocketRef.current = new VpsSocket({
+      onSnapshot: (payload) => applyVpsPayloadRef.current(payload),
+      onLogLines: (lines) => {
+        // Same line-format mapping as the HTTP log poller; WS pushes only new
+        // lines, but a rotated/truncated log resends its tail — dedupe on it.
+        const lineRegex = /^(.+?) - (INFO|WARNING|ERROR|DEBUG|CRITICAL) - (.*)$/;
+        lines.forEach(raw => {
+          const line = raw.trim();
+          const match = lineRegex.exec(line);
+          if (!match) return;
+          const [, , level, message] = match;
+          if (!message.trim()) return;
+          const id = `${level}_${message.slice(0, 80)}`;
+          if (seenWsLogs.has(id)) return;
+          seenWsLogs.add(id);
+          if (seenWsLogs.size > 4000) seenWsLogs.clear();
+          const mappedLevel: LogMessage['level'] =
+            level === 'WARNING' ? 'WARN' : level === 'CRITICAL' ? 'ERROR' : (level as LogMessage['level']);
+          addLog(mappedLevel, 'SYS', message.trim());
+        });
+      },
+      onStatus: (update) => {
+        setWsTransport(update.transport);
+        const prevTransport = lastWsTransportRef.current;
+        if (update.transport !== prevTransport) {
+          lastWsTransportRef.current = update.transport;
+          if (update.transport === 'websocket') {
+            addLog('SUCCESS', 'SYS', `Realtime WebSocket connected (${vpsEndpointRef.current || 'same-origin'}/ws) — live push active, HTTP polling paused.`);
+          } else if (update.transport === 'polling') {
+            addLog('WARN', 'SYS', `${update.error || 'WebSocket unavailable'} — falling back to HTTP polling (2.5s).`);
+          }
+        }
+        if (update.transport === 'websocket') {
+          setVpsStatus(prev => ({
+            ...prev,
+            connected: true,
+            endpoint: vpsEndpointRef.current || prev.endpoint,
+            latencyMs: update.latencyMs ?? prev.latencyMs,
+            error: undefined
+          }));
+        } else if (update.transport === 'polling') {
+          // Don't clobber engine state here — the HTTP fallback poll (still
+          // running) sets engineStatus/engineRunning on its next result.
+          setVpsStatus(prev => ({ ...prev, connected: false, error: update.error }));
+        }
+      }
+    });
+  }
 
   // UTC-midnight reset of daily PnL & streaks (mirrors the Python engine's daily drawdown reset)
   useEffect(() => {
@@ -368,28 +444,19 @@ export default function App() {
 
   // Real VPS Data Fetcher (reads SQLite trading.db and PM2 engine state via status.py HTTP endpoint)
   // Re-created when its deps change so the polling useEffect can re-subscribe.
-  const fetchVpsData = useCallback(async () => {
-    if (dataSource !== 'vps') return;
-    setIsPollingVps(true);
+  // Shared status processor: BOTH the WebSocket push path and the HTTP polling
+  // fallback funnel every /api/status payload through this exact mapping, so the
+  // two transports can never disagree about how a snapshot maps to app state.
+  const processVpsStatus = useCallback((json: any, latency?: number) => {
     const targetBase = (vpsEndpoint || (typeof window !== 'undefined' ? window.location.origin : '')).replace(/\/+$/, '');
-    const url = targetBase.endsWith('/api/status') ? targetBase : `${targetBase}/api/status`;
-
-    const startTime = performance.now();
     try {
-      const res = await fetch(url, { mode: 'cors' });
-      const latency = Math.round(performance.now() - startTime);
-
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-      }
-      const json = await res.json();
       const rawProcess = String(json.process || '');
       const isEngineRunning = rawProcess.includes('RUNNING') || rawProcess.includes('ONLINE');
 
       setVpsStatus({
         connected: true,
         endpoint: targetBase,
-        latencyMs: latency,
+        latencyMs: latency ?? vpsStatusRef.current.latencyMs,
         engineStatus: rawProcess || 'RUNNING',
         engineRunning: isEngineRunning,
         lastSyncTime: new Date().toLocaleTimeString(),
@@ -602,6 +669,36 @@ export default function App() {
         if (runTickRef.current) runTickRef.current();
       }, 50);
     } catch (err: any) {
+      // Processing errors must never kill the push/poll loop itself.
+      console.error('VPS status processing failed:', err);
+    }
+  }, [ensureCandlesForSymbol, vpsEndpoint]);
+
+  const fetchVpsData = useCallback(async () => {
+    if (dataSource !== 'vps') return;
+    // Over WebSocket the snapshot already arrives via push — only flag the
+    // spinner when this call performs an actual HTTP round-trip.
+    if (wsTransportRef.current === 'websocket') {
+      applyVpsPayloadRef.current = processVpsStatus;
+    } else {
+      setIsPollingVps(true);
+    }
+    const targetBase = (vpsEndpoint || (typeof window !== 'undefined' ? window.location.origin : '')).replace(/\/+$/, '');
+    const url = targetBase.endsWith('/api/status') ? targetBase : `${targetBase}/api/status`;
+
+    const startTime = performance.now();
+    try {
+      const res = await fetch(url, { mode: 'cors' });
+      const latency = wsTransportRef.current === 'websocket'
+        ? (vpsStatusRef.current.latencyMs ?? Math.round(performance.now() - startTime))
+        : Math.round(performance.now() - startTime);
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      }
+      const json = await res.json();
+      processVpsStatus(json, latency);
+    } catch (err: any) {
       setVpsRiskAvailable(false);
       setVpsStatus(prev => ({
         ...prev,
@@ -611,17 +708,40 @@ export default function App() {
         engineRunning: false
       }));
     } finally {
-      setIsPollingVps(false);
+      if (wsTransportRef.current !== 'websocket') setIsPollingVps(false);
     }
-  }, [dataSource, vpsEndpoint, ensureCandlesForSymbol]);
+  }, [dataSource, vpsEndpoint, ensureCandlesForSymbol, wsTransport, processVpsStatus]);
 
-  // Periodic VPS Polling
+  // Periodic VPS Polling — HTTP fallback. When the WebSocket push is live,
+  // polling drops to a 30s safety net (config drift, missed pushes); it ramps
+  // back to 2.5s automatically whenever the socket is down.
   useEffect(() => {
     if (dataSource !== 'vps') return;
+    if (wsTransport === 'websocket') {
+      const interval = setInterval(fetchVpsData, 30_000);
+      return () => clearInterval(interval);
+    }
     fetchVpsData();
     const interval = setInterval(fetchVpsData, 2500);
     return () => clearInterval(interval);
-  }, [dataSource, fetchVpsData]);
+  }, [dataSource, wsTransport, fetchVpsData]);
+
+  // WebSocket lifecycle: connect when VPS mode is active, disconnect otherwise.
+  useEffect(() => {
+    const sock = vpsSocketRef.current;
+    if (!sock) return;
+    if (dataSource === 'vps') {
+      applyVpsPayloadRef.current = processVpsStatus;
+      sock.connect(vpsEndpoint || (typeof window !== 'undefined' ? window.location.origin : ''));
+    } else {
+      sock.disconnect();
+      setWsTransport('connecting');
+    }
+    return () => {
+      if (dataSource === 'vps') return; // keep the socket across renders
+      sock.disconnect();
+    };
+  }, [dataSource, vpsEndpoint, processVpsStatus]);
 
   // Send a remote control command to the live engine via status.py (POST /api/control)
   const sendVpsControl = useCallback(async (action: 'pause' | 'resume' | 'close_all' | 'close_symbol', symbol?: string): Promise<boolean> => {
@@ -679,6 +799,9 @@ export default function App() {
       const message = `Applied ${json.count} tunable keys to VPS .env. ${reloadNote}`;
       setVpsPushResult({ ok: true, message });
       addLog('SUCCESS', 'SYS', `VPS config pushed: ${(json.applied || []).join(', ')}`);
+      // Ask the realtime channel for an immediate snapshot; the delayed HTTP
+      // fetch stays as a backstop for when the socket is down.
+      vpsSocketRef.current?.refresh();
       setTimeout(() => fetchVpsData(), 2500);
       return { ok: true, message };
     } catch (err: any) {
@@ -989,11 +1112,6 @@ export default function App() {
     const curActiveTrades = activeTradesRef.current;
     const curEquity = equityRef.current;
     const curDailyPnl = dailyRealizedPnlRef.current;
-    // Re-read these each tick so a concurrent VPS sync or user slider can be picked
-    // up without waiting for the next re-render cycle.
-    const curWinStreak = winStreak;
-    const curLossStreak = lossStreak;
-    const curCooldownEndsAt = cooldownEndsAt;
     const now = Date.now();
 
     // Best-effort mirror of the draw-down state that the closure batch will mutate.
@@ -1338,6 +1456,7 @@ export default function App() {
         isPolling={isPollingVps}
         controlPaused={vpsControl.paused}
         onToggleVpsPause={handleToggleVpsPause}
+        wsTransport={wsTransport}
       />
 
       {/* Main Content Area */}

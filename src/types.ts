@@ -10,6 +10,10 @@ export interface BotConfig {
   trailingStopActivate: number;
   trailingStopCallback: number;
   swingLookback: number;
+  bbPeriod: number;
+  bbStdDev: number;
+  bbUpperPctB: number;
+  bbStretchGateEnabled: boolean;
   maxHoldTime: number; // seconds
   signalThreshold: number; // 1 to 5
   signalInterval: number; // seconds
@@ -43,6 +47,7 @@ export interface FactorAnalysis {
   signal: 'BUY' | 'SELL' | 'NEUTRAL';
   atr: number;
   adx: number;
+  bollingerPctB: number;
   reason: string;
   skippedReason?: string;
 }

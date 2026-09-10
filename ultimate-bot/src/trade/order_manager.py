@@ -145,7 +145,7 @@ class OrderManager:
                     avg_fill_price = float(status.get("avgPrice", status.get("price", 0)))
                     await self.db.update_order_status(order_id, "FILLED", executed_qty, avg_fill_price)
                     return True, executed_qty
-                elif status["status"] in ["CANCELED", "EXPIRED", "REJECTED", "FILLED"]:
+                elif status["status"] in ["CANCELED", "EXPIRED", "REJECTED"]:
                     await self.db.update_order_status(order_id, status["status"], 0)
                     return status["status"] == "FILLED", float(status.get("executedQty", 0))
             except Exception as e:

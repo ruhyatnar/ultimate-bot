@@ -57,14 +57,7 @@ class HealthCheck:
         self._last_reconnect_time[component] = now
         for attempt in range(3):
             try:
-                if component == "all":
-                    await self.reconnect("rest")
-                    if self.enable_ws:
-                        if self.ws_api and not self.config.get("PAPER_TRADE", False):
-                            await self.reconnect("ws_api")
-                        if self.ws_stream:
-                            await self.reconnect("ws_stream")
-                elif component == "ws_api":
+                if component == "ws_api":
                     if self.ws_api:
                         await self.ws_api.disconnect()
                         await self.ws_api.connect()

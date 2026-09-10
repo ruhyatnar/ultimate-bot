@@ -384,6 +384,11 @@ class TradeLogic:
         trade = {
             "symbol": symbol, "entry_price": entry_price, "side": side, "quantity": qty,
             "entry_time": time.time(), "stop_price": stop_price, "take_profit": take_profit,
+            # R-multiple anchor for the scale-out check. The breakeven lock raises
+            # stop_price to entry*1.0025 long before +1R in every preset, which made
+            # (entry - stop_price) negative and permanently disabled scale-out.
+            # Measuring R against the INITIAL stop keeps both features working.
+            "initial_stop_price": stop_price,
             "atr": atr, "trailing_active": False, "trailing_stop": stop_price,
             "breakeven_activated": False, "order_id": order_id,
             "initial_qty": qty,
@@ -423,7 +428,7 @@ class TradeLogic:
                 and trade.get("initial_qty")
                 and trade["quantity"] > 0
             ):
-                risk_per_unit = trade["entry_price"] - trade["stop_price"]
+                risk_per_unit = trade["entry_price"] - trade.get("initial_stop_price", trade["stop_price"])
                 r_multiple = (price - trade["entry_price"]) / risk_per_unit if risk_per_unit > 0 else 0.0
                 if r_multiple >= float(self.config.get("SCALE_OUT_R_MULTIPLE", 1.0)):
                     scale_qty = trade["quantity"] * float(self.config.get("SCALE_OUT_FRACTION", 0.5))
@@ -712,18 +717,6 @@ class TradeLogic:
         emoji = "✅" if pnl >= 0 else "❌"
         await self.webhook.send(f"{emoji} CLOSE {symbol} ({reason}) Net PnL: {pnl:+.2f} USDT (Gross: {gross_pnl:+.2f}, Fees: -{total_fees:.2f})")
         self.logger.info(f"Closed {symbol} due to {reason}, Net PnL: {pnl:.2f} (Gross: {gross_pnl:.2f}, Fees: -{total_fees:.2f})")
-
-        # Clean up pending remote-control state if this was a requested close.
-        control = self._read_control()
-        if control.get("close_all") or control.get("close_symbol"):
-            symbol_key = control.get("close_symbol", "").strip().upper()
-            if not control.get("close_all") and symbol_key and symbol_key == symbol:
-                self.logger.info(f"Remote close_symbol for {symbol} fully completed.")
-            elif control.get("close_all"):
-                # close_all may have targeted multiple symbols; only clear if this symbol
-                # was part of that request and is now gone from active_trades.
-                if symbol not in self.active_trades:
-                    self.logger.info(f"Remote close_all: {symbol} fully closed.")
 
     async def reconcile_positions(self):
         self.logger.info("Reconciling positions...")

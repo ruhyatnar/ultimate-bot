@@ -8,6 +8,7 @@ import ENV_EXAMPLE from '../../ultimate-bot/.env.example?raw';
 import CONFIG_PY from '../../ultimate-bot/config.py?raw';
 import MAIN_PY from '../../ultimate-bot/main.py?raw';
 import STATUS_PY from '../../ultimate-bot/status.py?raw';
+import BACKTEST_PY from '../../ultimate-bot/backtest.py?raw';
 import ECOSYSTEM_JS from '../../ultimate-bot/ecosystem.config.cjs?raw';
 import REQUIREMENTS_TXT from '../../ultimate-bot/requirements.txt?raw';
 import INIT_PY_RAW from '../../ultimate-bot/src/__init__.py?raw';
@@ -69,14 +70,28 @@ export const BOT_FILES: BotFileDefinition[] = [
     path: 'status.py',
     name: 'status.py',
     category: 'root',
-    description: 'CLI terminal dashboard AND the embedded web monitor: serves /api/status JSON plus the dashboard UI (SPA fallback, gzip, ETag/304, Range, keep-alive — full npx serve parity).',
+    description: 'CLI terminal dashboard AND the embedded web monitor: React frontend + WebSocket API + Python backend on one port — /ws realtime push (RFC 6455, stdlib) with /api/status HTTP polling fallback, plus the dashboard UI (SPA fallback, gzip, ETag/304, Range, keep-alive).',
     enhancements: [
       'Read-only SQLite access (mode:ro, WAL, 10s busy timeout) so it never locks the engine',
       'CORS-enabled /api/status, /api/health and /api/config endpoints for the web dashboard',
+      'WebSocket /ws streams status snapshots (1s) + incremental log tails with auto HTTP-polling fallback',
       '--web PORT serves the React dashboard from ./dist or a built-in fallback UI',
       'Secrets (API keys, webhooks) are stripped from every API response'
     ],
     content: STATUS_PY,
+  },
+  {
+    path: 'backtest.py',
+    name: 'backtest.py',
+    category: 'root',
+    description: 'Strategy backtest engine: replays REAL Binance klines through the live engine\'s own decision core (SignalGenerator.decide) with identical trade management — SL/TP, trailing, breakeven, scale-out, fees, risk sizing, drawdown breaker. Includes a --disable-bb A/B flag to measure the Bollinger gate\'s value.',
+    enhancements: [
+      'Zero drift: backtests the exact SignalGenerator.decide code the live engine trades with',
+      'Full trade-management parity: R:R gate, MIN_TP floor, gap-aware stops, scale-out vs initial-stop R anchor',
+      'Honest metrics: win rate, profit factor, expectancy, avg R-multiple, max drawdown, fee drag',
+      'A/B testing: --disable-bb flag isolates the Bollinger stretch gate\'s contribution'
+    ],
+    content: BACKTEST_PY,
   },
   {
     path: 'ecosystem.config.cjs',

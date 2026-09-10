@@ -172,10 +172,17 @@ class RiskManager:
                 state["loss_streak"] += 1
                 state["win_streak"] = 0
             now = int(datetime.now().timestamp())
+            # When a streak trips its circuit breaker, the streak is RESET as the
+            # cooldown arms. Without this, loss_streak stays >= MAX_LOSS_STREAK
+            # forever, so EVERY subsequent loss re-arms the cooldown and the symbol
+            # effectively trades once per cooldown window until a win happens —
+            # not the documented "N consecutive losses → pause → fresh start".
             if pnl > 0 and state["win_streak"] >= self.config["MAX_WIN_STREAK"]:
                 state["cooldown_until"] = now + self.config["COOLDOWN_WIN"]
+                state["win_streak"] = 0
             elif pnl < 0 and state["loss_streak"] >= self.config["MAX_LOSS_STREAK"]:
                 state["cooldown_until"] = now + self.config["COOLDOWN_LOSS"]
+                state["loss_streak"] = 0
             await self.save_state()
 
     async def calculate_position_size(self, symbol, entry_price, stop_price):
@@ -208,15 +215,6 @@ class RiskManager:
         allocation = Decimal(str(self.total_equity)) * Decimal(str(self.config["BALANCE_USAGE_PERCENT"]))
         max_symbol_alloc = Decimal(str(self.total_equity)) * Decimal(str(self.config["MAX_SYMBOL_ALLOCATION_PERCENT"]))
         allocation = min(allocation, max_symbol_alloc)
-        alloc_qty = allocation / Decimal(str(entry_price))
-
-        # Take the more conservative of the two sizings.
-        qty_dec = Decimal(str(risk_qty))
-        if alloc_qty < qty_dec:
-            qty_dec = alloc_qty
-            self.logger.debug(
-                f"{symbol}: notional cap limited size to {float(alloc_qty):.6f} (risk-based size was {risk_qty:.6f})."
-            )
 
         # Safeguard: Never allocate more than available free quote currency (e.g. USDT)
         free_quote = None
@@ -233,38 +231,38 @@ class RiskManager:
             except Exception as e:
                 self.logger.warning(f"Failed to check free quote asset balance: {e}")
 
-        qty_dec = allocation / Decimal(str(entry_price))
+        alloc_qty = allocation / Decimal(str(entry_price))
+
+        # CRITICAL: take the more conservative of the two sizings — the risk-based
+        # size is PRIMARY and must never be overwritten by the notional cap, or a
+        # wide ATR stop silently risks far more than RISK_PER_TRADE of equity.
+        qty_dec = Decimal(str(risk_qty))
+        if alloc_qty < qty_dec:
+            qty_dec = alloc_qty
+            self.logger.debug(
+                f"{symbol}: notional cap limited size to {float(alloc_qty):.6f} (risk-based size was {risk_qty:.6f})."
+            )
+
         filters = await self.rest.get_filters(symbol)
         step_size = Decimal(str(filters.get("LOT_SIZE", {}).get("stepSize", "0.000001")))
         min_qty = Decimal(str(filters.get("LOT_SIZE", {}).get("minQty", "0.00001")))
-        
+
         # Check NOTIONAL filter
         notional_filter = filters.get("NOTIONAL", filters.get("MIN_NOTIONAL", {}))
         min_notional = float(notional_filter.get("minNotional", 5.0))
-        if float(allocation) < min_notional:
-            needed = min_notional * 1.02
-            if free_quote is not None and free_quote < needed:
-                self.logger.warning(
-                    f"Free quote balance ({free_quote:.2f} {self.config.get('QUOTE_ASSET', 'USDT')}) is below minNotional ({needed:.2f}) for {symbol}. Order skipped."
-                )
-                return 0.0
-            if float(self.total_equity) >= min_notional:
-                self.logger.info(f"Allocation {float(allocation):.2f} USDT is below minNotional {min_notional} for {symbol}. Bumping allocation to minNotional.")
-                qty_dec = Decimal(str(needed)) / Decimal(str(entry_price))
-            else:
-                self.logger.warning(f"Total equity {self.total_equity} is less than minNotional {min_notional} for {symbol}.")
-                return 0.0
 
-        # Floor at minQty, but never let the floor override the risk cap: if the
-        # risk-based size steps below the exchange minimum, the trade cannot be
-        # taken safely at 1% risk — skipping is the professional move, not
-        # up-sizing to minNotional and blowing through the risk budget.
-        if qty_dec < min_qty:
+        # Never let exchange floors override the risk cap: if the risk-based size
+        # steps below the exchange minimum, the trade cannot be taken safely at
+        # RISK_PER_TRADE risk — skipping is the professional move, not up-sizing
+        # to minNotional and blowing through the risk budget.
+        if qty_dec < min_qty or float(qty_dec) * entry_price < min_notional:
             self.logger.info(
-                f"{symbol}: risk-based size {float(qty_dec):.6f} is below exchange minQty {float(min_qty)}; entry skipped "
-                f"(risking minNotional would exceed the {self.config.get('RISK_PER_TRADE', 0.01)*100:.1f}% risk cap)."
+                f"{symbol}: risk-based size {float(qty_dec):.6f} is below exchange minimums "
+                f"(minQty {float(min_qty)}, minNotional {min_notional:.2f}); entry skipped "
+                f"(risking the minimum would exceed the {self.config.get('RISK_PER_TRADE', 0.01)*100:.1f}% risk cap)."
             )
             return 0.0
+
         qty_dec = (qty_dec // step_size) * step_size
         qty_dec = max(qty_dec, min_qty)
         if "maxQty" in filters.get("LOT_SIZE", {}):
@@ -274,7 +272,9 @@ class RiskManager:
         if order_cost < min_notional:
             qty_step_up = qty_dec + step_size
             cost_step_up = float(qty_step_up) * entry_price
-            if (free_quote is None or cost_step_up <= free_quote) and cost_step_up <= float(self.total_equity):
+            # A one-step bump may only be taken if it stays inside the risk budget.
+            risk_budget_ok = float(qty_step_up) * risk_per_unit <= risk_amount
+            if risk_budget_ok and (free_quote is None or cost_step_up <= free_quote) and cost_step_up <= float(self.total_equity):
                 qty_dec = qty_step_up
                 order_cost = cost_step_up
             else:

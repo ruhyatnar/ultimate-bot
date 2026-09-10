@@ -20,7 +20,8 @@ Engineered for **Debian 13 (Trixie) CLI-only VPS** environments with zero GUI ov
 10. [Running the Bot (PM2 Supervision)](#-running-the-bot-pm2-supervision)
 11. [Monitoring: CLI, Web Server & Control API](#-monitoring-cli-web-server--control-api)
 12. [Risk Management & Safety Mechanisms](#-risk-management--safety-mechanisms)
-13. [Troubleshooting & Emergency Procedures](#-troubleshooting--emergency-procedures)
+13. [Backtesting (Prove It Before You Trade It)](#-backtesting-prove-it-before-you-trade-it)
+14. [Troubleshooting & Emergency Procedures](#-troubleshooting--emergency-procedures)
 
 ---
 
@@ -32,7 +33,7 @@ Engineered for **Debian 13 (Trixie) CLI-only VPS** environments with zero GUI ov
 - **SQLite State Machine**: ACID-compliant persistence (`data/trading.db`) with **WAL mode**, a **dedicated read-only connection** for the monitor, and an **asynchronous batched write queue** that eliminates `database is locked` errors.
 - **Debian 13 & PEP 668 Native**: Runs inside an isolated Python virtual environment (`python3-venv`), never polluting system packages.
 - **PM2 Process Supervision**: `ecosystem.config.cjs` supervises **both** the engine (`main.py`) and the web monitor (`status.py --web 3000`) with auto-restart, a 2 GB memory cap, and rotating log files. (`.cjs` — the repo's root `package.json` sets `"type": "module"`, which would otherwise break `pm2 start` on CommonJS configs.)
-- **Unified Terminal & Web Monitor**: `status.py` serves an `htop`-style terminal dashboard **and** an embedded HTTP API (`/api/status`, `/api/logs`, `/api/health`, `/api/config`, `/api/control`) used by the interactive React web dashboard.
+- **Unified Terminal & Web Monitor**: `status.py` serves an `htop`-style terminal dashboard **and** an embedded API (`/api/status`, `/api/logs`, `/api/health`, `/api/config`, `/api/control`) used by the interactive React web dashboard — **React frontend + WebSocket API + Python backend**, all from one port: `ws://<host>/ws` streams realtime status snapshots and incremental engine log lines (RFC 6455, stdlib-only server) with automatic HTTP polling fallback for proxies that block WebSocket upgrades.
 - **Remote Operation**: The web dashboard can pause new entries, resume, liquidate all positions, close a single symbol, and push tuned `.env` parameters — no SSH required.
 - **Config Boot Validation**: `config.py` validates every tunable key at startup (ranges, non-negativity, integer minimums) so a typo in `.env` fails fast with a clear message instead of producing silent bad behavior.
 - **Feeds the Web Operations Center**: the engine persists live positions, orders, risk state, scanned candidates and balances to SQLite, and the React dashboard reads them over `status.py`'s API — the UI never fabricates server-side figures.
@@ -62,6 +63,7 @@ Open positions are re-evaluated every cycle and closed by market order on the fi
 - **Gap-Breach Protection** — stop/TP checks compare both the just-closed and the currently forming candle's low/high (not only the live tick), so violent wicks that pierce the stop between polls still trigger the exit.
 - **Trailing Stop** — activates at `TRAILING_STOP_ACTIVATE` profit and ratchets up with `TRAILING_STOP_CALLBACK`.
 - **Fee-Aware Breakeven Lock** — at ≥ +1% profit the stop moves to `entry × 1.0025`, covering the 0.2% round-trip taker fees.
+- **Bollinger Overextension Gate** — BUYs are refused when Bollinger %B ≥ `BB_UPPER_PCT_B` (default 0.95 = at/above the upper band). All five confluence factors are momentum signals; this gate blocks the vertical, overextended candles that mean-revert into the ATR stop before TP fires. Disable with `BB_STRETCH_GATE_ENABLED=false`.
 - **Max Hold Time** — positions older than `MAX_HOLD_TIME` seconds are closed (TIME_STOP).
 - **Partial-Fill Handling** — a partially filled exit order is cancelled, remaining marketable balance is re-quantized and re-tracked; non-tradable dust is treated as a full exit.
 
@@ -106,6 +108,16 @@ All realized PnL is **net of 0.1% taker fees on both legs** (0.2% round-trip) so
 17. **VPS `.env` Sync Credential Safety (FIXED)** — the 1-click SSH sync command now backs up the existing `.env` (`.env.bak.<timestamp>`) before overwriting and warns that `BINANCE_API_KEY` / `BINANCE_API_SECRET` must be preserved; the browser `POST /api/config` path remains a whitelist that never touches credentials.
 18. **Graceful Shutdown Hang (FIXED)** — SIGINT/SIGTERM previously cancelled `main()` itself mid-`finally` and then stopped the loop, so `ws_stream.disconnect()` hung forever on a torn-down WebSocket (`connection_lost_waiter` never resolved). PM2 `reload`/`restart` would hang and the single-instance lock stayed held, blocking the next start. Signal handlers now only set a shutdown event; `main()` cancels the background loops itself, then tears down connections with **bounded timeouts** (`ws_stream`/`ws_api` close with a 3s cap + transport abort; the REST client's periodic time-sync task is cancelled on close). Verified live under `PAPER_TRADE=true`: clean exit in ~5s, `Shutdown complete.` logged, lock released, no pending-task warnings.
 19. **PM2 Config Broken by ESM `package.json` (FIXED)** — the repo root `package.json` declares `"type": "module"`, so Node treated `ecosystem.config.js` (CommonJS) as ESM and `pm2 start ecosystem.config.js` failed with `ReferenceError: module is not defined`. The file is now `ecosystem.config.cjs` (explicit CommonJS), and every command/README/UI reference was updated. The full flow — `pm2 start ecosystem.config.cjs` → `POST /api/config` (whitelist push) → `pm2 reload ultimate-bot` — was verified end-to-end: reload exit code 0, restart count incremented, engine back online and holding the lock with the new config.
+20. **Risk-Based Position Sizing Silently Overwritten by Notional Cap (FIXED)** — `calculate_position_size` computed the correct 1%-risk quantity, then immediately overwrote it with the full per-symbol allocation cap (`qty = allocation / price`), so the documented fixed-fractional risk model never actually ran. A wide ATR stop on a 20%-allocation position risked ~2–5% of equity per trade instead of 1%. The risk-based size is now primary and the notional cap only ever *reduces* it; the minNotional one-step bump is also gated by the risk budget, and sub-minimum risk sizes skip the entry instead of up-sizing past the risk cap.
+21. **Bollinger Overextension Gate Added** — the 5-factor confluence stack is momentum-only, so the engine now also computes a Bollinger Bands %B position gauge (20-bar, 2σ by default) and refuses BUYs when the live price is statistically stretched (%B ≥ 0.95). This closes the stack's mean-reversion blind spot without changing `SIGNAL_THRESHOLD` semantics; tunable via `BB_PERIOD` / `BB_STD_DEV` / `BB_UPPER_PCT_B` / `BB_STRETCH_GATE_ENABLED`.
+22. **UI Presets Contradicted the Engine (FIXED)** — the web dashboard's `PRESET_MAP` shipped ATR multipliers and trailing levels that differed from `config.py`'s `PRESETS` (e.g. UI scalping 0.8/1.2 ATR vs the engine's 1.0/2.0), so tuning from the dashboard pushed a different strategy than the one documented. The UI presets now mirror the engine exactly.
+23. **WebSocket Realtime Monitoring (React + WS API + Python)** — the dashboard previously HTTP-polled `/api/status` every 2.5s. `status.py` now embeds a stdlib-only RFC 6455 WebSocket server on the same port (`ws://<host>:3000/ws`): status snapshots push every 1s and engine log lines stream as they are written. The React client (`vpsSocket.ts`) auto-falls-back to HTTP polling when the upgrade is blocked, and the connection bar shows `WS LIVE` vs `HTTP POLL`. Paper- and live-mode monitor behavior verified by dedicated functional suites (29 checks).
+24. **Streak Cooldown Became a Permanent Throttle (FIXED)** — `update_trade_result` armed the loss/win-streak cooldown without resetting the streak counter, so after 3 losses **every** subsequent loss re-armed the cooldown and the symbol traded roughly once per cooldown window until a random win. The streak now resets when its breaker trips (documented "N consecutive losses → pause → fresh start" semantics).
+25. **One Bad DB Table Zeroed the Dashboard (FIXED)** — `read_database` returned an all-empty payload if any single query failed (e.g. `orders` busy), which also wiped `risk_state` and made live-mode monitors display equity $0.00 while the engine was fine. Each section now reads/degrades independently, with `risk_state` read first.
+26. **Scale-Out Could Never Fire (FIXED)** — the +1R scale-out measured R against the *current* stop, but the hardcoded +1% breakeven lock raises that stop to `entry × 1.0025` before +1R in every preset, making `risk_per_unit` negative and permanently disabling scale-out. R is now anchored to the trade's **initial** stop (`initial_stop_price`), keeping both features functional.
+27. **Backtest Engine Added (`backtest.py`)** — replays real Binance klines through the live engine's **own** `SignalGenerator.decide()` core (zero strategy drift) with full trade-management parity: R:R gate, MIN_TP floor, gap-aware stops, trailing, breakeven lock, scale-out, 0.1%/leg taker fees, 1% risk sizing with notional caps, and the daily drawdown breaker. Metrics: win rate, profit factor, expectancy, avg R-multiple, max drawdown, fee drag. `--disable-bb` runs an A/B that isolates the Bollinger gate's contribution (measured: it saves ~4.2% equity over 10 days on BTC day preset). **Honest results on recent data:** day preset WR 12.6% / PF 0.09 (−7.4%), swing preset WR 38.5% / PF 0.43 (−3.8%), threshold 5 cuts the bleed to −0.8% — the strategy still has negative expectancy on the tested window and needs positive-expectancy tuning (or a wider sample) before live funds.
+28. **Bracket Rebalanced from Backtest Evidence (day preset)** — a 21-point parameter sweep plus targeted A/B runs identified the structural killer: the 0.5% `MIN_TP_PERCENT` floor made TP ~8× wider than the 1.2×-ATR stop, so 87% of trades resolved as −1R stop-outs (measured WR 12.6%, PF 0.09). The day preset now ships the backtest-proven bracket — **3.0× ATR stop, 3.5× ATR TP, 0.15% TP floor** — plus a 3h default `COOLDOWN_LOSS` (measured PF 0.49 → 0.79 with it). Verified on BTC (WR 50%, PF 0.79, −0.09 R) and ETH (WR 60%). UI presets, `.env.example` and the UI `.env` generator mirror the new values.
+29. **Exhaustive Edge Hunt: Signal Family Proven Fee-Bound** — every remaining lever was measured on honest long samples (BTC 5m×50d, BTC/ETH/SOL 15m×~156d): LTF ADX regime gate (PF 0.28→0.33, expectancy flat), R-based breakeven/trailing triggers (PF 0.52→**0.24** — early locks get shaken out by 15m noise; rejected), volume-confirmation gate (PF 0.52→0.45 — high-volume signal bars *underperform*; rejected), max-hold & cooldown sweeps (current values already optimal). Diagnosis: on every asset/timeframe the **gross (pre-fee) edge ≈ 0** — fees are the entire loss. Best implementable lever found: **maker-fee TP exits** (`--maker-tp`, models OCO limit TP at 0.02% vs 0.1% taker) — improves every run (swing PF 0.52→0.54, day 0.30→0.33). Also fixed a backtest realism bug: gap-aware stop fills now use the bar's actual **open** price (was close), which alone improved swing results −4.18%→−3.44% by not over-penalizing gap stop-outs.
 
 ---
 
@@ -219,6 +231,12 @@ TRAILING_STOP_ACTIVATE=0.015
 TRAILING_STOP_CALLBACK=0.005
 SWING_LOOKBACK=5
 MAX_HOLD_TIME=28800         # seconds before a TIME_STOP exit
+
+# Bollinger overextension gate (blocks stretched BUY entries)
+BB_PERIOD=20                # band lookback in closed candles
+BB_STD_DEV=2.0              # band width in standard deviations
+BB_UPPER_PCT_B=0.95         # %B above which a BUY is blocked (1.0 = upper band)
+BB_STRETCH_GATE_ENABLED=true
 ```
 
 ### Signal confluence engine
@@ -314,10 +332,11 @@ Set `PRESET=scalping|day|swing` in `.env`. Presets only apply where a key is **n
 | Execution Timeframe | `1m` | `5m` | `15m` |
 | HTF Timeframe | `15m` | `1h` | `4h` |
 | ATR Period | `10` | `14` | `20` |
-| Stop Loss Multiplier | `0.8× ATR` | `1.5× ATR` | `2.0× ATR` |
-| Take Profit Multiplier | `1.2× ATR` | `2.5× ATR` | `4.0× ATR` |
-| Trailing Stop Activation | `+0.5%` | `+1.5%` | `+2.5%` |
-| Trailing Stop Callback | `0.2%` | `0.5%` | `1.0%` |
+| Stop Loss Multiplier | `1.0× ATR` | `3.0× ATR` | `2.0× ATR` |
+| Take Profit Multiplier | `2.0× ATR` | `3.5× ATR` | `4.0× ATR` |
+| Min TP Floor (`MIN_TP_PERCENT`) | `0.08%` | `0.15%` | `0.30%` |
+| Trailing Stop Activation | `+0.5%` | `+1.5%` | `+3.0%` |
+| Trailing Stop Callback | `0.2%` | `0.5%` | `1.2%` |
 | Swing Lookback | `3` | `5` | `8` |
 | Max Hold Time | `1 hour` | `8 hours` | `24 hours` |
 
@@ -365,6 +384,8 @@ pm2 start ecosystem.config.cjs
 ```
 
 Then open `http://YOUR_VPS_IP:3000`. When a compiled `./dist` exists next to `status.py`, it serves the React dashboard **with full `npx serve -s dist` parity** — SPA fallback for client-side routes, clean-URL directory redirects (301), ETag/`304` revalidation, immutable caching for content-hashed `/assets/*`, gzip compression, HTTP `Range` support and HTTP/1.1 keep-alive on a multi-threaded `ThreadingHTTPServer` (several viewers can poll simultaneously without blocking each other). No Node.js, `npx serve` or reverse proxy is required on the VPS.
+
+**Realtime transport (React + WebSocket + Python):** the dashboard first opens a WebSocket to `ws(s)://<host>:3000/ws` and receives pushed status snapshots every second plus engine log lines as they are written — no polling round-trips. If the upgrade is unavailable (restrictive proxy, old backend), it falls back to HTTP polling of `/api/status` every 2.5s automatically; the connection badge shows `WS LIVE` vs `HTTP POLL`. The standalone fallback dashboard uses the same WS-first strategy. Control commands (`/api/control`, `/api/config`) remain HTTP POSTs by design — they are idempotent and safe to retry.
 
 If no compiled `dist/` is found, `status.py --web` falls back to a built-in standalone dark-mode dashboard that includes a **Performance & Risk section** (win rate with W/L/B breakdown, profit factor, total realized PnL, average win/loss and the win/loss streak monitor) alongside the balance cards, market scanner, active positions and recent orders.
 
@@ -429,6 +450,65 @@ cd /path/to/ultimate-bot
 ```
 
 It can also be run from the repo root via `npm run smoke`. Requires network access to Binance (the engine fetches `exchangeInfo` at boot) and a free `/tmp/ultimate_bot.lock` (stop any running engine first).
+
+---
+
+## 🔬 Backtesting (Prove It Before You Trade It)
+
+`backtest.py` replays **real** historical Binance klines through the live engine's **own** `SignalGenerator.decide()` — the exact code that trades real money, so there is zero drift between what is tested and what trades. Trade management is identical to the engine: R:R gate, `MIN_TP_PERCENT` floor, gap-aware stops, trailing stop, fee-aware breakeven lock, +1R scale-out, 0.1%/leg taker fees on both legs, 1% risk sizing with notional caps and the daily drawdown breaker.
+
+```bash
+cd ultimate-bot
+./venv/bin/python3 backtest.py --symbol BTCUSDT --preset day --pages 4          # ~20 days of 5m data
+./venv/bin/python3 backtest.py --symbol BTCUSDT --preset day --pages 4 --disable-bb  # A/B the Bollinger gate
+./venv/bin/python3 backtest.py --symbol ETHUSDT --preset swing --pages 4 --threshold 5
+```
+
+| Flag | Purpose |
+|---|---|
+| `--symbol` / `--preset` | Market + preset (default `BTCUSDT` / `day`) |
+| `--pages N` | Days of history (1 page ≈ 5 days on 5m) |
+| `--threshold` / `--sl` / `--tp` / `--min-tp` / `--cooldown-bars` / `--bb-pctb` / `--scale-frac` | Override any strategy parameter |
+| `--disable-bb` | Turn the Bollinger stretch gate off for A/B comparison |
+| `--adx-min X` | Research gate: skip entries when LTF ADX(14) < X (chop filter) |
+| `--vol-mult X` | Research gate: require signal-bar volume ≥ X × its 20-bar average |
+| `--bb-lower X` | Research gate: skip entries with Bollinger %B ≤ X (falling-knife filter) |
+| `--be-r X` / `--trail-r X` | Research: trigger breakeven/trailing at R-multiples instead of fixed % |
+| `--max-hold S` | Research: override `MAX_HOLD_TIME` (seconds) |
+| `--maker-tp` | Research: TP exits pay maker fee (0.02%, OCO limit leg) instead of taker 0.1% |
+| `--quiet` | One-line summary instead of full JSON (for sweeps) |
+
+**Measured results (BTCUSDT 5m, 20 days, net of 0.2% round-trip fees):**
+
+| Config | Trades | Win rate | Profit factor | Expectancy |
+|---|---|---|---|---|
+| Old defaults (1.2×/2.4× ATR, 0.5% TP floor) | 151 | 12.6% | 0.09 | −0.98 R |
+| **New defaults (3.0×/3.5× ATR, 0.15% floor) + 36-bar cooldown** | 22 | **50.0%** | **0.79** | **−0.09 R** |
+| New defaults, no cooldown | 35 | 45.7% | 0.49 | −0.27 R |
+| Old defaults, Bollinger gate disabled | 257 | 10.5% | 0.10 | — |
+
+**What the backtest proved (and what changed as a result):**
+
+1. **The old day preset's 0.5% `MIN_TP_PERCENT` floor made the TP ~8× wider than the ATR stop.** A nominal 1:2 bracket actually realized as ~1:8, so 87% of trades died at −1R. Lowering the floor to 0.15% and widening the stop to 3× ATR balanced the bracket: win rate 12.6% → 50%, PF 0.09 → 0.79. These are now the shipped defaults.
+2. **The 36-bar (3h on 5m) post-exit cooldown nearly doubled profit factor** vs no cooldown (0.79 vs 0.49) by skipping revenge-trade churn. `COOLDOWN_LOSS` now defaults to 3h.
+3. **The Bollinger stretch gate saves ~4.2% equity over 10 days** — it stays on by default.
+4. Threshold 5 (all five factors) trades too rarely on 5m to matter; **threshold 4 remains optimal**.
+5. **Expectancy is still slightly negative (−0.09 R)** on this window: the risk framework is sound and the bracket is balanced, but this is **not** a proven positive-edge strategy yet. Keep paper trading and re-run the backtest on fresh data monthly.
+
+**Long-sample edge hunt (the follow-up campaign, ~50–156 day windows):**
+
+On honest long samples the 20-day PF 0.79 does **not** hold (BTC 5m×50d: PF 0.28–0.33; BTC 15m×156d: PF 0.52; ETH 0.37; SOL 0.59). The measured decomposition is decisive: on every asset and timeframe **net loss ≈ total fees, i.e. the gross (pre-fee) edge is ≈ 0** — the signal predicts direction no better than chance, and the cost of trading it is the whole loss. Every signal-side lever was tested and measured:
+
+| Hypothesis | Result | Verdict |
+|---|---|---|
+| LTF ADX(14) regime gate (18/22/25) | PF 0.28→0.33, expectancy flat | Marginal — not the edge |
+| R-based breakeven/trailing triggers | PF 0.52→**0.24** | **Rejected** — early locks get shaken out by noise |
+| Volume-confirmation gate (1.5×–3× avg) | PF 0.52→0.45, fewer trades | **Rejected** — loud signal bars *underperform* |
+| Max-hold 6h→12/24/48h | PF ≤ 0.53 | Current 24h already optimal |
+| Cooldown 0/24/96 bars | PF ≤ 0.53 | Current 36 bars already optimal |
+| **Maker-fee TP exits (OCO limit)** | **PF 0.52→0.54, every run improves** | **Adopt** — only lever that helped everywhere |
+
+The structural conclusion: a 5-factor momentum-confluence signal with ~zero gross edge cannot be tuned profitable — the fix is a **different or additional signal** (e.g. higher-timeframe momentum alignment, funding-rate/microstructure filters), not more exit engineering. Meanwhile the fee lever is real money: place TP as an OCO **limit** (maker 0.02%) rather than market (taker 0.1%) — a 40% round-trip fee cut that helps every configuration. Re-run the backtest after **any** parameter change — if a config cannot show PF > 1 over 100+ trades, it does not go live.
 
 ---
 

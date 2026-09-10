@@ -48,6 +48,14 @@ ATR_MULTIPLIER_TP=${config.atrMultiplierTp}
 TRAILING_STOP_ACTIVATE=${config.trailingStopActivate}
 TRAILING_STOP_CALLBACK=${config.trailingStopCallback}
 SWING_LOOKBACK=${config.swingLookback}
+
+# --- Bollinger Band Overextension Gate ---
+# Blocks BUY entries when Bollinger %B >= BB_UPPER_PCT_B (price statistically
+# stretched at/above the upper band) — the momentum stack's mean-reversion blind spot.
+BB_PERIOD=${config.bbPeriod}
+BB_STD_DEV=${config.bbStdDev}
+BB_UPPER_PCT_B=${config.bbUpperPctB}
+BB_STRETCH_GATE_ENABLED=${config.bbStretchGateEnabled}
 MAX_HOLD_TIME=${config.maxHoldTime}
 
 # --- Confluence & Signal Engine ---
@@ -63,7 +71,8 @@ MAX_WIN_STREAK=${config.maxWinStreak}
 COOLDOWN_LOSS=${config.cooldownLoss}
 COOLDOWN_WIN=${config.cooldownWin}
 MAX_SLIPPAGE_PERCENT=0.5
-MIN_TP_PERCENT=0.005
+# TP floor: backtest-proven 0.15% on 5m (0.5% made TP ~8x the ATR stop -> 87% stop-outs)
+MIN_TP_PERCENT=0.0015
 
 # --- Risk Model & Trade Management ---
 # 1% fixed-fractional risk per trade (qty sized from entry-to-stop distance)

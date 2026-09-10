@@ -228,6 +228,76 @@ def main():
             check("monitor reads the isolated temp DB", matches_db,
                   f"api=({api_closed},{api_wins},{api_losses}) db=({db_closed},{db_wins},{db_losses})")
 
+            # ---- 3b. WebSocket realtime stream (React + WS API + Python stack) ----
+            print("\n[3b/5] WebSocket /ws realtime push...")
+            # Minimal RFC 6455 client: handshake, then read pushed messages.
+            # Asserts the server accepts the upgrade and streams at least one
+            # realtime status snapshot without any client request.
+            ws_probe = r"""
+import base64, json, os, socket, struct, sys
+
+host, port = sys.argv[1], int(sys.argv[2])
+sock = socket.create_connection((host, port), timeout=5)
+key = base64.b64encode(os.urandom(16)).decode()
+req = (f"GET /ws HTTP/1.1\r\nHost: {host}:{port}\r\n"
+       "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+       f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+sock.sendall(req.encode())
+resp = b""
+while b"\r\n\r\n" not in resp:
+    chunk = sock.recv(4096)
+    if not chunk:
+        raise SystemExit(2)
+    resp += chunk
+head, buf = resp.split(b"\r\n\r\n", 1)
+if b" 101 " not in head.split(b"\r\n")[0]:
+    print(head.decode(errors="replace")[:120])
+    raise SystemExit(2)
+
+def readexact(n):
+    global buf
+    while len(buf) < n:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise SystemExit(2)
+        buf += chunk
+    out, buf = buf[:n], buf[n:]
+    return out
+
+def read_message():
+    b1, b2 = readexact(2)
+    ln = b2 & 0x7F
+    if ln == 126:
+        ln = struct.unpack(">H", readexact(2))[0]
+    elif ln == 127:
+        ln = struct.unpack(">Q", readexact(8))[0]
+    return b1 & 0x0F, readexact(ln)
+
+import time
+deadline = time.time() + 15
+types = []
+while time.time() < deadline and "status" not in types:
+    sock.settimeout(max(0.5, deadline - time.time()))
+    try:
+        op, payload = read_message()
+    except (socket.timeout, OSError):
+        break
+    if op in (0x1, 0x2):
+        try:
+            types.append(json.loads(payload.decode("utf-8")).get("type", "status"))
+        except Exception:
+            pass
+sock.close()
+print(",".join(types) or "none")
+"""
+            probe = subprocess.run(
+                [PYTHON, "-c", ws_probe, "127.0.0.1", str(port)],
+                capture_output=True, text=True, timeout=45,
+            )
+            ws_ok = probe.returncode == 0 and "status" in probe.stdout
+            check("ws /ws upgrade + realtime status push", ws_ok,
+                  (probe.stdout.strip() or probe.stderr.strip()[-120:]))
+
         # ---- 4. Clean SIGTERM shutdown ----
         print("\n[4/5] SIGTERM graceful shutdown...")
         engine.send_signal(signal.SIGTERM)

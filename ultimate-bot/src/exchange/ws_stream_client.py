@@ -16,10 +16,8 @@ class WSStreamClient:
         self.websocket = None
         self.connected = False
         self.last_price = {}
-        self.klines_cache = {}
         self._listen_task = None
         self._reconnect_task = None
-        self.max_klines_per_symbol = 500
         self._subscribed_symbols = set()
 
     # Bound initial connect attempts so a dead network fails fast into REST fallback
@@ -194,15 +192,9 @@ class WSStreamClient:
             symbol = data.get("s")
             if symbol:
                 self.last_price[symbol] = {"price": float(data.get("p", 0)), "time": int(time.time() * 1000)}
-        elif e == "kline":
-            symbol = data.get("s")
-            k = data.get("k")
-            if symbol and k and k.get("x") is True:
-                if symbol not in self.klines_cache:
-                    self.klines_cache[symbol] = []
-                self.klines_cache[symbol].append(k)
-                if len(self.klines_cache[symbol]) > self.max_klines_per_symbol:
-                    self.klines_cache[symbol] = self.klines_cache[symbol][-self.max_klines_per_symbol:]
+        # Kline events are intentionally not cached: the engine reads OHLCV straight
+        # from REST when needed (signal generation, ATR refresh, gap checks) and a
+        # websocket-side kline buffer was never read by any consumer.
 
     async def get_current_price(self, symbol):
         entry = self.last_price.get(symbol)

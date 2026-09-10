@@ -24,6 +24,30 @@ export function calculateATR(highs: number[], lows: number[], closes: number[], 
   return slice.length > 0 ? sum / slice.length : closes[closes.length - 1] * 0.01;
 }
 
+/** Bollinger Bands %B position gauge: (close - lower) / (upper - lower).
+ *  Bands are computed from `period` closed candles (stable), but the position is
+ *  evaluated against the LIVE close — entries execute at the live price, so an
+ *  intrabar spike into the upper band is caught too. 0.5 = midline, 1.0 = upper.
+ *  Mirrors SignalGenerator._calculate_bollinger_pct_b in the Python engine. */
+export function calculateBollingerPctB(
+  closes: number[],
+  period: number = 20,
+  stdDev: number = 2.0
+): number {
+  const closed = closes.slice(0, -1); // bands exclude the forming candle
+  if (closed.length < period) return 0.5;
+  const window = closed.slice(-period);
+  const mid = window.reduce((a, b) => a + b, 0) / period;
+  const variance = window.reduce((acc, v) => acc + (v - mid) ** 2, 0) / period;
+  const sd = Math.sqrt(variance);
+  const width = 2 * stdDev * sd;
+  if (!isFinite(sd) || sd <= 0 || width <= 0) return 0.5;
+  const upper = mid + stdDev * sd;
+  const lower = mid - stdDev * sd;
+  const close = closes[closes.length - 1]; // live close = entry price
+  return (close - lower) / width;
+}
+
 export function analyzeCandles(
   symbol: string,
   candles: { open: number; high: number; low: number; close: number; volume: number }[],
@@ -42,6 +66,7 @@ export function analyzeCandles(
       signal: 'NEUTRAL',
       atr: 50,
       adx: 20,
+      bollingerPctB: 0.5,
       reason: 'Insufficient candle data',
       skippedReason: 'Insufficient candle history for technical indicators'
     };
@@ -139,6 +164,7 @@ export function analyzeCandles(
 
   const atr = calculateATR(highs, lows, closes, config.atrPeriod);
   const adx = 26 + (bullish - bearish) * 3 + (Math.sin(currentPrice) * 5);
+  const bollingerPctB = calculateBollingerPctB(closes, config.bbPeriod, config.bbStdDev);
 
   const threshold = config.signalThreshold;
   let signal: 'BUY' | 'SELL' | 'NEUTRAL' = 'NEUTRAL';
@@ -148,6 +174,17 @@ export function analyzeCandles(
     signal = 'BUY';
   } else if (bearish >= threshold) {
     signal = 'SELL';
+  }
+
+  // Bollinger overextension gate (mirrors the engine): a BUY blocked here means
+  // price closed at/above the upper band — statistically stretched, waiting for a pullback.
+  const bbBlocked =
+    config.bbStretchGateEnabled &&
+    signal === 'BUY' &&
+    bollingerPctB >= config.bbUpperPctB;
+  if (bbBlocked) {
+    signal = 'NEUTRAL';
+    skippedReason = `Bollinger overextended (%B ${bollingerPctB.toFixed(2)} >= ${config.bbUpperPctB}) — waiting for pullback`;
   }
 
   if (signal === 'NEUTRAL') {
@@ -180,6 +217,7 @@ export function analyzeCandles(
     signal,
     atr,
     adx: Math.max(10, Math.min(80, adx)),
+    bollingerPctB,
     reason,
     skippedReason
   };

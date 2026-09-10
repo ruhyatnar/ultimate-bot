@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
 CLI & Web Real-Time Monitor for Ultimate Binance Trading Bot
-Provides an htop/terminal-style live dashboard and comprehensive HTTP API for headless Debian 13 VPS environments.
+Provides an htop/terminal-style live dashboard and comprehensive HTTP + WebSocket API for headless Debian 13 VPS environments.
+
+Monitoring stack: React (Vite) frontend + WebSocket API + Python backend.
+status.py serves both layers on one port:
+  - HTTP  /api/* endpoints + static React build from ../dist
+  - WS    /ws realtime status/log push (RFC 6455, stdlib handshake + framing)
+          with the HTTP polling endpoints retained as a fallback for proxies
+          that block WebSocket Upgrade requests.
 
 Usage:
   python3 status.py          # Single status snapshot
   python3 status.py --watch  # Continuous live-refresh terminal monitor (every 2s)
-  python3 status.py --web    # Launch HTTP monitoring server on port 3000 (serves React dist or standalone HTML)
+  python3 status.py --web    # Launch HTTP+WS monitoring server on port 3000 (serves React dist or standalone HTML)
 """
 
 import os
@@ -17,17 +24,26 @@ import json
 import uuid
 import sqlite3
 import argparse
+import base64
 import gzip
+import hashlib
+import hmac
 import mimetypes
 import shutil
+import socket
+import struct
 import subprocess
+import threading
 import urllib.request
 import urllib.parse
-import hmac
-import hashlib
 from datetime import datetime
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+
+# Monitoring stack (per design): React frontend + WebSocket API + Python backend.
+# status.py is a single-file Python backend serving BOTH layers on one port:
+#   - HTTP  /api/*, static React build from ../dist
+#   - WS    /ws  realtime status/log push (RFC 6455, stdlib handshake + framing)
 
 # ANSI Color Codes for Terminal Display
 GREEN = "\033[92m"
@@ -44,6 +60,18 @@ CLEAR = "\033[2J\033[H"
 _balance_cache = {"ts": 0, "data": None}
 _scanned_cache = {"ts": 0, "data": None}
 _tickers_cache = {"ts": 0, "data": {}}
+
+# ---------------------------------------------------------------------------
+# WebSocket hub — realtime push of status snapshots + log tails to browsers.
+# The HTTP handler thread accepts the WS connection (stdlib handshake), then a
+# per-client writer thread streams frames. Broadcasts happen on the monitor's
+# push thread so the HTTP API never blocks on slow clients.
+# ---------------------------------------------------------------------------
+WS_MAGIC_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_ws_clients = set()          # raw TCP sockets of connected dashboards
+_ws_clients_lock = threading.Lock()
+_ws_status_cache = {"json": None, "ts": 0.0}   # 1s coalescing cache for broadcasts
+_ws_stop = threading.Event()
 
 
 def find_env_path(hint=None):
@@ -97,9 +125,9 @@ TUNING_KEYS = {
     "SYMBOL_REFRESH_INTERVAL", "DB_PATH", "CONTROL_FILE", "DISCORD_COOLDOWN",
     "LOG_LEVEL", "LOG_FILE", "HEALTH_CHECK_INTERVAL", "REST_WEIGHT_LIMIT",
     "ENTRY_TIMEOUT", "AUTO_LIQUIDATE_ORPHANS",
-    "BASE_ORDER_SIZE", "ORDER_TYPE",
     "RISK_PER_TRADE", "MIN_RISK_REWARD",
     "SCALE_OUT_ENABLED", "SCALE_OUT_R_MULTIPLE", "SCALE_OUT_FRACTION",
+    "BB_PERIOD", "BB_STD_DEV", "BB_UPPER_PCT_B", "BB_STRETCH_GATE_ENABLED",
 }
 
 
@@ -188,6 +216,238 @@ def tail_log_file(log_path, lines=120):
         return []
 
 
+def build_status_payload(env_config, db_path):
+    """Compose the /api/status JSON. Single source of truth shared by the HTTP
+    route and the /ws realtime push so both transports always agree."""
+    db_data = read_database(db_path)
+    status_str = get_process_status()
+    clean_status = status_str.replace(GREEN, "").replace(RED, "").replace(YELLOW, "").replace(RESET, "")
+    safe_config = {k: v for k, v in env_config.items() if "KEY" not in k and "SECRET" not in k and "WEBHOOK" not in k}
+    control = read_control(env_config.get("CONTROL_FILE", "./data/engine_control.json"))
+
+    # Live balance and candidate symbols
+    balance_info = fetch_binance_balance(env_config, db_data)
+    candidates = fetch_scanned_pairs(env_config, db_data)
+
+    # Merge balance info into risk payload so legacy clients read total_equity automatically
+    risk_payload = dict(db_data.get("risk", {}))
+    risk_payload["total_equity"] = str(balance_info.get("total_equity", 0.0))
+    risk_payload["live_equity"] = str(balance_info.get("total_equity", 0.0))
+    risk_payload["paper_balance"] = str(balance_info.get("total_equity", 0.0))
+    risk_payload["free_quote"] = str(balance_info.get("free_quote", 0.0))
+    risk_payload["locked_quote"] = str(balance_info.get("locked_quote", 0.0))
+
+    return {
+        "process": clean_status,
+        "config": safe_config,
+        "balance": balance_info,
+        "candidates": candidates,
+        "scanned_pairs": candidates,
+        "data": {
+            "risk": risk_payload,
+            "trades": db_data.get("trades", []),
+            "orders": db_data.get("orders", []),
+            "stats": db_data.get("stats", {}),
+            "balance": balance_info,
+            "scanned_pairs": candidates,
+            "balances": balance_info.get("balances", [])
+        },
+        "control": {
+            "paused": bool(control.get("paused", False)),
+            "pause_reason": control.get("pause_reason", "") or ""
+        },
+        "server_time": datetime.now().isoformat(),
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+
+# ---------------------------------------------------------------------------
+# WebSocket server (RFC 6455, stdlib only — no external dependency).
+# ---------------------------------------------------------------------------
+def _ws_compute_accept(key):
+    """RFC 6455 Sec-WebSocket-Accept = b64(sha1(key + GUID))."""
+    return base64.b64encode(hashlib.sha1((key + WS_MAGIC_GUID).encode("ascii")).digest()).decode("ascii")
+
+
+def _ws_encode_frame(payload, opcode=0x1):
+    """Encode an unmasked server→client text/binary frame."""
+    header = bytearray([0x80 | opcode])
+    n = len(payload)
+    if n < 126:
+        header.append(n)
+    elif n < 65536:
+        header.append(126)
+        header += struct.pack(">H", n)
+    else:
+        header.append(127)
+        header += struct.pack(">Q", n)
+    return bytes(header) + payload
+
+
+def _ws_read_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("socket closed")
+        buf += chunk
+    return buf
+
+
+def _ws_recv_message(sock):
+    """Read one complete message (handles fragmentation + control frames).
+    Returns (opcode, payload)."""
+    opcode = None
+    message = b""
+    while True:
+        b1, b2 = _ws_read_exact(sock, 2)
+        fin = b1 & 0x80
+        frame_op = b1 & 0x0F
+        masked = b2 & 0x80
+        length = b2 & 0x7F
+        if length == 126:
+            length = struct.unpack(">H", _ws_read_exact(sock, 2))[0]
+        elif length == 127:
+            length = struct.unpack(">Q", _ws_read_exact(sock, 8))[0]
+        if length > 1_000_000:
+            raise ConnectionError("frame too large")
+        mask = _ws_read_exact(sock, 4) if masked else b"\x00\x00\x00\x00"
+        data = _ws_read_exact(sock, length)
+        if masked:
+            data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+
+        if frame_op == 0x8:  # close
+            try:
+                sock.sendall(_ws_encode_frame(data[:2], opcode=0x8))
+            except OSError:
+                pass
+            raise ConnectionError("peer closed")
+        if frame_op == 0x9:  # ping → pong (RFC 6455 §5.5.2)
+            sock.sendall(_ws_encode_frame(data, opcode=0xA))
+            continue
+        if frame_op == 0xA:  # unsolicited pong — ignore
+            continue
+        if frame_op in (0x1, 0x2):
+            opcode = frame_op
+        message += data
+        if fin:
+            return opcode, message
+
+
+def _ws_send_json(sock, obj):
+    sock.sendall(_ws_encode_frame(json.dumps(obj, default=str).encode("utf-8"), opcode=0x1))
+
+
+def _ws_drop_client(sock):
+    with _ws_clients_lock:
+        _ws_clients.discard(sock)
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _ws_broadcast(snapshot_json):
+    """Send a pre-serialized status snapshot to every connected dashboard.
+    Serializes once, never blocks the HTTP thread on slow sockets."""
+    frame = _ws_encode_frame(snapshot_json, opcode=0x1)
+    with _ws_clients_lock:
+        targets = list(_ws_clients)
+    for sock in targets:
+        try:
+            sock.sendall(frame)
+        except OSError:
+            _ws_drop_client(sock)
+
+
+def _ws_periodic_pusher(env_config, db_path, log_path):
+    """Pusher thread: streams status snapshots (1s tick, coalesced) + log tails
+    (new lines only, every 2s) to all dashboards until shutdown."""
+    last_log_size = 0
+    next_status = 0.0
+    while not _ws_stop.is_set():
+        try:
+            if _ws_stop.wait(0.25):
+                return
+            with _ws_clients_lock:
+                active = len(_ws_clients)
+            if active == 0:
+                continue
+            now = time.time()
+            if now >= next_status:
+                next_status = now + 1.0
+                payload = build_status_payload(env_config, db_path)
+                snapshot_json = json.dumps(payload, default=str)
+                _ws_status_cache["json"] = snapshot_json
+                _ws_broadcast(snapshot_json)
+
+            # Incremental log tail: only when the file has grown since last push.
+            if log_path:
+                try:
+                    size = os.path.getsize(log_path)
+                except OSError:
+                    size = 0
+                if size < last_log_size:
+                    last_log_size = 0  # rotated/truncated → resend the tail
+                if size > last_log_size:
+                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                        if last_log_size:
+                            f.seek(last_log_size)
+                        new_lines = f.readlines()
+                    last_log_size = size
+                    if new_lines:
+                        frame = _ws_encode_frame(
+                            json.dumps({"type": "log", "lines": new_lines}, default=str).encode("utf-8"),
+                            opcode=0x1)
+                        with _ws_clients_lock:
+                            targets = list(_ws_clients)
+                        for sock in targets:
+                            try:
+                                sock.sendall(frame)
+                            except OSError:
+                                _ws_drop_client(sock)
+        except Exception:
+            # The pusher must survive transient I/O errors (DB locked, etc.)
+            time.sleep(1.0)
+
+
+def _ws_client_thread(sock, env_config, db_path, log_path):
+    """Per-connection thread: sends the hello snapshot then streams client
+    control frames (ping/pong handled inline) until the peer disconnects."""
+    try:
+        sock.settimeout(600)
+        hello = json.dumps({"type": "hello", "server_time": datetime.now().isoformat()}, default=str).encode("utf-8")
+        sock.sendall(_ws_encode_frame(hello, opcode=0x1))
+        # Initial snapshot so the dashboard paints without waiting a tick.
+        try:
+            snap = _ws_status_cache.get("json") or json.dumps(build_status_payload(env_config, db_path), default=str)
+        except Exception:
+            snap = None
+        if snap:
+            sock.sendall(_ws_encode_frame(snap.encode("utf-8"), opcode=0x1))
+        while True:
+            try:
+                opcode, payload = _ws_recv_message(sock)
+                # App-level ping → pong with the caller's timestamp so browsers
+                # can display a live round-trip latency figure.
+                if opcode in (0x1, 0x2) and payload:
+                    try:
+                        req = json.loads(payload.decode("utf-8"))
+                    except Exception:
+                        continue
+                    if isinstance(req, dict) and req.get("type") == "ping":
+                        _ws_send_json(sock, {"type": "pong", "echo_ts": req.get("ts")})
+            except socket.timeout:
+                # Idle keepalive: prove the link is alive; drop on failure.
+                sock.sendall(_ws_encode_frame(b"", opcode=0x9))
+            except ConnectionError:
+                break
+    except (ConnectionError, OSError):
+        pass
+    finally:
+        _ws_drop_client(sock)
+
+
 def get_process_status():
     lock_file = "/tmp/ultimate_bot.lock"
     if not os.path.exists(lock_file):
@@ -209,16 +469,22 @@ def read_database(db_path):
     if not os.path.exists(db_path):
         return {"error": f"Database not found at {db_path}", "trades": [], "orders": [], "risk": {}, "stats": {}, "scanned_pairs": []}
 
+    result = {"risk": {}, "trades": [], "orders": [], "stats": {}, "scanned_pairs": [], "balances": []}
+    conn = None
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10.0)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
-        # Risk state
-        risk_rows = cur.execute("SELECT key, value FROM risk_state").fetchall()
-        risk = {}
-        for row in risk_rows:
-            risk[row["key"]] = row["value"]
+        # Risk state FIRST and independently: the live-mode balance fallback,
+        # streak monitor and daily PnL all live in risk_state — a broken
+        # orders/stats table must not zero them out for the dashboard.
+        risk = result["risk"]
+        try:
+            for row in cur.execute("SELECT key, value FROM risk_state").fetchall():
+                risk[row["key"]] = row["value"]
+        except sqlite3.Error:
+            pass
 
         # Parse JSON fields stored in risk_state if present
         scanned_pairs = []
@@ -235,15 +501,19 @@ def read_database(db_path):
             except Exception:
                 account_balances = []
 
-        # Active trades
-        trades_rows = cur.execute("SELECT * FROM active_trades").fetchall()
-        trades = [dict(row) for row in trades_rows]
+        # Each section degrades independently: a locked or partially-migrated
+        # table no longer wipes the whole payload.
+        try:
+            result["trades"] = [dict(row) for row in cur.execute("SELECT * FROM active_trades").fetchall()]
+        except sqlite3.Error:
+            pass
 
-        # Recent orders (last 25)
-        orders_rows = cur.execute(
-            "SELECT order_id, symbol, side, order_type, price, stop_price, quantity, executed_qty, status, created_at, updated_at, profit_loss, avg_fill_price FROM orders ORDER BY created_at DESC LIMIT 25"
-        ).fetchall()
-        orders = [dict(row) for row in orders_rows]
+        try:
+            result["orders"] = [dict(row) for row in cur.execute(
+                "SELECT order_id, symbol, side, order_type, price, stop_price, quantity, executed_qty, status, created_at, updated_at, profit_loss, avg_fill_price FROM orders ORDER BY created_at DESC LIMIT 25"
+            ).fetchall()]
+        except sqlite3.Error:
+            pass
 
         # Aggregate trade statistics.
         # "Closed trades" = SELL exit orders that recorded a realized PnL. This is
@@ -252,14 +522,17 @@ def read_database(db_path):
         # persisted as CANCELED SELL orders with a non-zero profit_loss. BUY entries,
         # NEW orders and CANCELED attempts (profit_loss NULL) are excluded so the
         # win/loss denominator can never be diluted by non-exits.
-        stats_row = cur.execute(
-            "SELECT COUNT(*) as total_orders, "
-            "SUM(CASE WHEN side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss IS NOT NULL THEN 1 ELSE 0 END) as closed_trades, "
-            "SUM(CASE WHEN side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss > 0 THEN 1 ELSE 0 END) as winning_trades, "
-            "SUM(CASE WHEN side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss < 0 THEN 1 ELSE 0 END) as losing_trades, "
-            "SUM(CASE WHEN status IN ('FILLED','CANCELED') AND profit_loss IS NOT NULL THEN profit_loss ELSE 0 END) as total_pnl "
-            "FROM orders"
-        ).fetchone()
+        try:
+            stats_row = cur.execute(
+                "SELECT COUNT(*) as total_orders, "
+                "SUM(CASE WHEN side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss IS NOT NULL THEN 1 ELSE 0 END) as closed_trades, "
+                "SUM(CASE WHEN side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss > 0 THEN 1 ELSE 0 END) as winning_trades, "
+                "SUM(CASE WHEN side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss < 0 THEN 1 ELSE 0 END) as losing_trades, "
+                "SUM(CASE WHEN status IN ('FILLED','CANCELED') AND profit_loss IS NOT NULL THEN profit_loss ELSE 0 END) as total_pnl "
+                "FROM orders"
+            ).fetchone()
+        except sqlite3.Error:
+            stats_row = None
 
         closed_trades = int(stats_row["closed_trades"] or 0) if stats_row else 0
         winning_trades = int(stats_row["winning_trades"] or 0) if stats_row else 0
@@ -270,16 +543,22 @@ def read_database(db_path):
         avg_win = 0.0
         if winning_trades > 0:
             # Average of winning trades' PnL only (NOT total_pnl, which includes losses)
-            win_row = cur.execute(
-                "SELECT SUM(profit_loss) FROM orders WHERE side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss > 0"
-            ).fetchone()
+            try:
+                win_row = cur.execute(
+                    "SELECT SUM(profit_loss) FROM orders WHERE side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss > 0"
+                ).fetchone()
+            except sqlite3.Error:
+                win_row = None
             avg_win = float(win_row[0] or 0.0) / winning_trades if win_row and win_row[0] else 0.0
         avg_loss = 0.0
         if losing_trades > 0:
             # Sum of losing PnL only (avg_loss shown as a positive magnitude)
-            loss_row = cur.execute(
-                "SELECT SUM(profit_loss) FROM orders WHERE side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss < 0"
-            ).fetchone()
+            try:
+                loss_row = cur.execute(
+                    "SELECT SUM(profit_loss) FROM orders WHERE side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss < 0"
+                ).fetchone()
+            except sqlite3.Error:
+                loss_row = None
             avg_loss = abs(float(loss_row[0] or 0.0)) / losing_trades if loss_row and loss_row[0] else 0.0
         profit_factor = (avg_win * winning_trades) / (avg_loss * losing_trades) if (avg_loss * losing_trades) > 0 else (0.0 if total_pnl <= 0 else float('inf'))
 
@@ -299,17 +578,22 @@ def read_database(db_path):
             "daily_pnl": float(risk.get("daily_pnl") or 0.0)
         }
 
-        conn.close()
-        return {
-            "risk": risk,
-            "trades": trades,
-            "orders": orders,
-            "stats": stats,
-            "scanned_pairs": scanned_pairs,
-            "balances": account_balances
-        }
+        result["scanned_pairs"] = scanned_pairs
+        result["balances"] = account_balances
+        result["stats"] = stats
+
+        return result
     except Exception as e:
-        return {"error": str(e), "trades": [], "orders": [], "risk": {}, "stats": {}, "scanned_pairs": [], "balances": []}
+        # Partial results are still valuable: whatever sections read cleanly
+        # before the failure are preserved for the dashboard.
+        result["error"] = str(e)
+        return result
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def fetch_binance_balance(env_config, db_data):
@@ -905,11 +1189,8 @@ def get_standalone_html():
   <script>
     let isPaused = false;
 
-    async function updateStatus() {
-      try {
-        const res = await fetch('/api/status');
-        const data = await res.json();
-        document.getElementById('timestamp').innerText = 'Last updated: ' + data.timestamp + ' • Auto-refreshes every 2s';
+    function applyStatus(data) {
+        document.getElementById('timestamp').innerText = 'Last updated: ' + data.timestamp + (wsOk ? ' • live WebSocket push' : ' • polling every 2s');
 
         // Engine status badge
         const badge = document.getElementById('statusBadge');
@@ -1049,8 +1330,52 @@ def get_standalone_html():
           html += '</tbody></table>';
           document.getElementById('ordersTable').innerHTML = html;
         }
+    }
+
+    async function updateStatus() {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+        applyStatus(data);
       } catch (e) {
         console.error('Failed to fetch status', e);
+      }
+    }
+
+    // Realtime WebSocket push (React + WS API + Python backend stack) with
+    // automatic fallback to HTTP polling whenever the socket is not open.
+    let wsSock = null;
+    let wsOk = false;
+    let pollTimer = null;
+
+    function startPolling() {
+      if (pollTimer) return;
+      updateStatus();
+      pollTimer = setInterval(updateStatus, 2000);
+    }
+    function stopPolling() {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    }
+    function connectWs() {
+      try {
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        wsSock = new WebSocket(proto + '//' + location.host + '/ws');
+        wsSock.onopen = () => { wsOk = true; stopPolling(); };
+        wsSock.onmessage = (ev) => {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg.type === 'log' || msg.type === 'hello') return;
+            if (msg.timestamp) applyStatus(msg);
+          } catch (e) { /* ignore malformed frame */ }
+        };
+        wsSock.onclose = () => {
+          wsOk = false;
+          startPolling();
+          setTimeout(connectWs, 5000);
+        };
+        wsSock.onerror = () => { try { wsSock.close(); } catch (e) {} };
+      } catch (e) {
+        startPolling();
       }
     }
 
@@ -1089,8 +1414,8 @@ def get_standalone_html():
       }
     }
 
-    updateStatus();
-    setInterval(updateStatus, 2000);
+    connectWs();
+    startPolling(); // immediate paint; polling stops automatically once WS opens
   </script>
 </body>
 </html>"""
@@ -1334,50 +1659,48 @@ def start_web_server(port, env_config, db_path):
             else:
                 self.send_error(404, "Not Found")
 
+        def _handle_websocket(self):
+            """RFC 6455 upgrade on /ws, then hand the socket to its streamer
+            thread. Any failure falls back to a normal HTTP 400 response."""
+            key = self.headers.get("Sec-WebSocket-Key", "")
+            upgrade = (self.headers.get("Upgrade") or "").lower()
+            connection = (self.headers.get("Connection") or "").lower()
+            if not key or upgrade != "websocket" or "upgrade" not in connection:
+                self.send_error(400, "WebSocket upgrade required")
+                return
+            try:
+                accept = _ws_compute_accept(key)
+                self.send_response(101, "Switching Protocols")
+                self.send_header("Upgrade", "websocket")
+                self.send_header("Connection", "Upgrade")
+                self.send_header("Sec-WebSocket-Accept", accept)
+                self.end_headers()
+                self.connection.settimeout(600)
+                # Flush the 101 response before the raw socket takes over.
+                try:
+                    self.wfile.flush()
+                except OSError:
+                    return
+            except OSError:
+                return
+            # Stream synchronously in THIS connection's thread: returning from
+            # do_GET would let http.server re-use/close the socket after its
+            # idle timeout, killing live sessions. ThreadingHTTPServer gives
+            # every connection a dedicated thread, so blocking here is safe.
+            _ws_client_thread(
+                self.connection,
+                env_config,
+                db_path,
+                env_config.get("LOG_FILE", "./logs/trading.log"),
+            )
+
         def do_GET(self):
             clean_path = self.path.split("?")[0]
+            if clean_path == "/ws":
+                self._handle_websocket()
+                return
             if clean_path in ["/api/status", "/api"]:
-                db_data = read_database(db_path)
-                status_str = get_process_status()
-                clean_status = status_str.replace(GREEN, "").replace(RED, "").replace(YELLOW, "").replace(RESET, "")
-                safe_config = {k: v for k, v in env_config.items() if "KEY" not in k and "SECRET" not in k and "WEBHOOK" not in k}
-                control = read_control(env_config.get("CONTROL_FILE", "./data/engine_control.json"))
-
-                # Live balance and candidate symbols
-                balance_info = fetch_binance_balance(env_config, db_data)
-                candidates = fetch_scanned_pairs(env_config, db_data)
-
-                # Merge balance info into risk payload so legacy clients read total_equity automatically
-                risk_payload = dict(db_data.get("risk", {}))
-                risk_payload["total_equity"] = str(balance_info.get("total_equity", 0.0))
-                risk_payload["live_equity"] = str(balance_info.get("total_equity", 0.0))
-                risk_payload["paper_balance"] = str(balance_info.get("total_equity", 0.0))
-                risk_payload["free_quote"] = str(balance_info.get("free_quote", 0.0))
-                risk_payload["locked_quote"] = str(balance_info.get("locked_quote", 0.0))
-
-                payload = {
-                    "process": clean_status,
-                    "config": safe_config,
-                    "balance": balance_info,
-                    "candidates": candidates,
-                    "scanned_pairs": candidates,
-                    "data": {
-                        "risk": risk_payload,
-                        "trades": db_data.get("trades", []),
-                        "orders": db_data.get("orders", []),
-                        "stats": db_data.get("stats", {}),
-                        "balance": balance_info,
-                        "scanned_pairs": candidates,
-                        "balances": balance_info.get("balances", [])
-                    },
-                    "control": {
-                        "paused": bool(control.get("paused", False)),
-                        "pause_reason": control.get("pause_reason", "") or ""
-                    },
-                    "server_time": datetime.now().isoformat(),
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-                self._send_json(payload)
+                self._send_json(build_status_payload(env_config, db_path))
                 return
 
             if clean_path == "/api/logs":
@@ -1537,8 +1860,18 @@ def start_web_server(port, env_config, db_path):
             self._send_json({"ok": False, "message": f"Unknown endpoint: {clean_path}"}, status=404)
 
     server = ThreadingHTTPServer(("0.0.0.0", port), CustomHandler)
+    # Realtime WebSocket push (React dashboard + WS API + Python backend stack).
+    _ws_stop.clear()
+    pusher = threading.Thread(
+        target=_ws_periodic_pusher,
+        args=(env_config, db_path, env_config.get("LOG_FILE", "./logs/trading.log")),
+        daemon=True,
+        name="ws-pusher",
+    )
+    pusher.start()
     print(f"{GREEN}{BOLD}⚡ Binance Bot Web Monitor running at:{RESET}")
     print(f"   {CYAN}http://0.0.0.0:{port}{RESET} (Local & VPS IP)")
+    print(f"   {CYAN}ws://0.0.0.0:{port}/ws{RESET} {DIM}(realtime status + log push; HTTP polling fallback retained){RESET}")
     if has_dist:
         print(f"   {DIM}Mode: Serving compiled React dashboard from ./dist (SPA fallback, gzip, ETag/304, Range, keep-alive){RESET}")
     else:
@@ -1549,6 +1882,13 @@ def start_web_server(port, env_config, db_path):
         server.serve_forever()
     except KeyboardInterrupt:
         print(f"\n{YELLOW}Stopping web monitor.{RESET}")
+    finally:
+        _ws_stop.set()
+        with _ws_clients_lock:
+            clients = list(_ws_clients)
+        for sock in clients:
+            _ws_drop_client(sock)
+        pusher.join(timeout=3)
         server.server_close()
 
 
