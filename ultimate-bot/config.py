@@ -1,6 +1,15 @@
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Load .env HERE — not only in main.py — so backtest.py, status.py, soak and
+# test harnesses all see the same configuration as the live engine. An explicit
+# path keeps this deterministic regardless of the caller's working directory.
+# Existing process-env vars still win (override=False default), so CLI research
+# overrides keep working.
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 PRESETS = {
     # Scalping: 1m entries, tight 1.0x/2.0x ATR bracket (R:R 2.0), fast trailing.
     # Tight stops demand HTF alignment — confluence gate stays at 4/5.
@@ -17,7 +26,25 @@ PRESETS = {
     # multi-day runners keep their room. Backtest on 15m data was negative for
     # ALL configs (the strategy's HTF trend gate filters too little on 15m);
     # floor lowered proportionally to keep the bracket balanced.
-    "swing": {"TIMEFRAME":"15m","MTF_TIMEFRAME":"4h","ATR_PERIOD":20,"ATR_MULTIPLIER_SL":2.0,"ATR_MULTIPLIER_TP":4.0,"TRAILING_STOP_ACTIVATE":0.03,"TRAILING_STOP_CALLBACK":0.012,"SWING_LOOKBACK":8,"MAX_HOLD_TIME":86400,"MIN_TP_PERCENT":0.003}
+    "swing": {"TIMEFRAME":"15m","MTF_TIMEFRAME":"4h","ATR_PERIOD":20,"ATR_MULTIPLIER_SL":2.0,"ATR_MULTIPLIER_TP":4.0,"TRAILING_STOP_ACTIVATE":0.03,"TRAILING_STOP_CALLBACK":0.012,"SWING_LOOKBACK":8,"MAX_HOLD_TIME":86400,"MIN_TP_PERCENT":0.003},
+    # swing_rsi: backtest-proven small-account strategy (2026-09-10, ~113 days,
+    # $22 equity, fees + $10 minNotional modeled): NEARUSDT +52.4% (PF 2.11,
+    # WR 55.3%, 38 trades, max DD 6.5%); 6/9 alt pairs positive. Daily-EMA50
+    # regime gate + 15m RSI<40 dip trigger; FIXED % bracket (SL -2% / TP +4%,
+    # TP as resting OCO limit = maker fee). ATR multipliers below are % of
+    # price in this mode; scale-out is disabled (the tested edge had none).
+    "swing_rsi": {"TIMEFRAME":"5m","MTF_TIMEFRAME":"1d","ATR_PERIOD":14,"ATR_MULTIPLIER_SL":0.02,"ATR_MULTIPLIER_TP":0.04,"TRAILING_STOP_ACTIVATE":0.05,"TRAILING_STOP_CALLBACK":0.01,"SWING_LOOKBACK":5,"MAX_HOLD_TIME":604800,"MIN_TP_PERCENT":0.04,"STRATEGY_MODE":"rsi_dip","SL_PERCENT":0.02,"TP_PERCENT":0.04,"RSI_PERIOD":14,"RSI_OVERSOLD":40.0,"RSI_TIMEFRAME":"15m","REGIME_EMA":50,"REGIME_SLOPE_DAYS":3,"COOLDOWN_LOSS":86400,"COOLDOWN_WIN":86400,"MAX_TRADES_PER_DAY":3},
+    # intraday_rsi: backtest-proven intraday variant (2026-09-11, 174 days, $22
+    # equity, honest taker/maker fees + $10 minNotional, same-UTC-day close):
+    # NEARUSDT +45.7% (PF 1.94, WR 51.7%, 58 trades, max DD 9.4%); all three
+    # 58-day sub-windows positive (+19.6/+15.6/+5.4%); all 9 parameter-
+    # neighborhood configs positive; +32% with 10bps slippage stress. Daily-
+    # EMA50 regime + 1h RSI(7)<40 dip trigger; % bracket (SL -1.2% / TP +3%,
+    # TP as OCO limit = maker fee); max 1 entry/day; position force-closed at
+    # UTC day end (CLOSE_AT_UTC_DAY_END); breakeven lock OFF (would exit the
+    # intraday trade before TP). Edge is PAIR-CONCENTRATED: 9-pair rotation
+    # was only +14.6% (PF 1.07) — run with STATIC_SYMBOLS=NEARUSDT.
+    "intraday_rsi": {"TIMEFRAME":"5m","MTF_TIMEFRAME":"1d","ATR_PERIOD":14,"ATR_MULTIPLIER_SL":0.012,"ATR_MULTIPLIER_TP":0.03,"TRAILING_STOP_ACTIVATE":0.05,"TRAILING_STOP_CALLBACK":0.01,"SWING_LOOKBACK":5,"MAX_HOLD_TIME":84600,"MIN_TP_PERCENT":0.03,"STRATEGY_MODE":"rsi_dip","SL_PERCENT":0.012,"TP_PERCENT":0.03,"RSI_PERIOD":7,"RSI_OVERSOLD":40.0,"RSI_TIMEFRAME":"1h","RSI_SOURCE":"ltf","REGIME_EMA":50,"REGIME_SLOPE_DAYS":3,"COOLDOWN_LOSS":86400,"COOLDOWN_WIN":86400,"MAX_TRADES_PER_DAY":1,"BREAKEVEN_ENABLED":False,"CLOSE_AT_UTC_DAY_END":True}
 }
 
 def load_config():
@@ -55,14 +82,25 @@ def load_config():
         "MAX_HOLD_TIME": int(os.getenv("MAX_HOLD_TIME", preset["MAX_HOLD_TIME"])),
         "RISK_PER_TRADE": float(os.getenv("RISK_PER_TRADE", 0.01)),
         "MIN_RISK_REWARD": float(os.getenv("MIN_RISK_REWARD", 1.5)),
-        "SCALE_OUT_ENABLED": os.getenv("SCALE_OUT_ENABLED", "true").lower() == "true",
+        # swing_rsi preset was proven WITHOUT scale-out; other presets keep the
+        # historical default. An explicit SCALE_OUT_ENABLED env always wins.
+        "SCALE_OUT_ENABLED": os.getenv("SCALE_OUT_ENABLED",
+                                       "false" if preset.get("STRATEGY_MODE") == "rsi_dip" else "true").lower() == "true",
+        # rsi_dip RSI series source:
+        #   'htf' = RSI computed on dedicated RSI_TIMEFRAME candle closes
+        #           (swing_rsi's proven 15m-candle convention).
+        #   'ltf' = RSI computed on execution-TF closes, sampled at the LAST
+        #           bar of each RSI_TIMEFRAME bucket (intraday_rsi's proven
+        #           convention: RSI(7) on 5m closes read at :55).
+        "RSI_SOURCE": os.getenv("RSI_SOURCE", preset.get("RSI_SOURCE", "htf")).lower(),
         "SCALE_OUT_R_MULTIPLE": float(os.getenv("SCALE_OUT_R_MULTIPLE", 1.0)),
         "SCALE_OUT_FRACTION": float(os.getenv("SCALE_OUT_FRACTION", 0.5)),
         "MAX_DAILY_DRAWDOWN": float(os.getenv("MAX_DAILY_DRAWDOWN", 0.05)),
         "MAX_LOSS_STREAK": int(os.getenv("MAX_LOSS_STREAK", 3)),
         "MAX_WIN_STREAK": int(os.getenv("MAX_WIN_STREAK", 5)),
-        "COOLDOWN_LOSS": int(os.getenv("COOLDOWN_LOSS", 10800)),
-        "COOLDOWN_WIN": int(os.getenv("COOLDOWN_WIN", 1800)),
+        "COOLDOWN_LOSS": int(os.getenv("COOLDOWN_LOSS", preset.get("COOLDOWN_LOSS", 10800))),
+        "COOLDOWN_WIN": int(os.getenv("COOLDOWN_WIN", preset.get("COOLDOWN_WIN", 1800))),
+        "MAX_TRADES_PER_DAY": int(os.getenv("MAX_TRADES_PER_DAY", preset.get("MAX_TRADES_PER_DAY", 0))),
         "TIMEFRAME": os.getenv("TIMEFRAME", preset["TIMEFRAME"]),
         "MTF_TIMEFRAME": os.getenv("MTF_TIMEFRAME", preset["MTF_TIMEFRAME"]),
         "ATR_PERIOD": int(os.getenv("ATR_PERIOD", preset["ATR_PERIOD"])),
@@ -71,6 +109,29 @@ def load_config():
         "TRAILING_STOP_ACTIVATE": float(os.getenv("TRAILING_STOP_ACTIVATE", preset["TRAILING_STOP_ACTIVATE"])),
         "TRAILING_STOP_CALLBACK": float(os.getenv("TRAILING_STOP_CALLBACK", preset["TRAILING_STOP_CALLBACK"])),
         "SWING_LOOKBACK": int(os.getenv("SWING_LOOKBACK", preset["SWING_LOOKBACK"])),
+        "STRATEGY_MODE": os.getenv("STRATEGY_MODE", preset.get("STRATEGY_MODE", "confluence")).lower(),
+        "SL_PERCENT": float(os.getenv("SL_PERCENT", preset.get("SL_PERCENT", 0.02))),
+        "TP_PERCENT": float(os.getenv("TP_PERCENT", preset.get("TP_PERCENT", 0.04))),
+        "RSI_PERIOD": int(os.getenv("RSI_PERIOD", preset.get("RSI_PERIOD", 14))),
+        "RSI_OVERSOLD": float(os.getenv("RSI_OVERSOLD", preset.get("RSI_OVERSOLD", 40.0))),
+        "RSI_TIMEFRAME": os.getenv("RSI_TIMEFRAME", preset.get("RSI_TIMEFRAME", "15m")),
+        # Bucket size (ms) for the rsi_dip RSI series. Derived from RSI_TIMEFRAME
+        # by default; an explicit RSI_TIMEFRAME_MS in .env overrides the map so
+        # the variable is genuinely tunable (nonstandard timeframes supported).
+        "RSI_TIMEFRAME_MS": int(os.getenv("RSI_TIMEFRAME_MS") or {"1m": 60_000, "3m": 180_000, "5m": 300_000,
+                             "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000}.get(
+            os.getenv("RSI_TIMEFRAME", preset.get("RSI_TIMEFRAME", "15m")), 900_000)),
+        "REGIME_EMA": int(os.getenv("REGIME_EMA", preset.get("REGIME_EMA", 50))),
+        "REGIME_SLOPE_DAYS": int(os.getenv("REGIME_SLOPE_DAYS", preset.get("REGIME_SLOPE_DAYS", 3))),
+        # Fee-aware breakeven lock (+1% profit -> stop to entry*1.0025). The
+        # intraday_rsi edge was proven WITHOUT it (BE exits before the +3% TP),
+        # so presets can disable it; an explicit env var always wins.
+        "BREAKEVEN_ENABLED": os.getenv("BREAKEVEN_ENABLED",
+                                       "true" if preset.get("BREAKEVEN_ENABLED", True) else "false").lower() == "true",
+        # intraday_rsi: force-close open positions at the UTC day end (research
+        # exits every trade the same day it opens). Explicit env var wins.
+        "CLOSE_AT_UTC_DAY_END": os.getenv("CLOSE_AT_UTC_DAY_END",
+                                          "true" if preset.get("CLOSE_AT_UTC_DAY_END", False) else "false").lower() == "true",
         "BB_PERIOD": int(os.getenv("BB_PERIOD", 20)),
         "BB_STD_DEV": float(os.getenv("BB_STD_DEV", 2.0)),
         "BB_UPPER_PCT_B": float(os.getenv("BB_UPPER_PCT_B", 0.95)),
@@ -89,6 +150,7 @@ def load_config():
         "PAPER_TRADE": os.getenv("PAPER_TRADE", "true").lower() == "true",
         "USE_TESTNET": os.getenv("USE_TESTNET", "false").lower() == "true",
         "AUTO_LIQUIDATE_ORPHANS": os.getenv("AUTO_LIQUIDATE_ORPHANS", "false").lower() == "true",
+        "ORPHAN_ADOPT_WINDOW_HOURS": int(os.getenv("ORPHAN_ADOPT_WINDOW_HOURS", "48")),
         "PRESET": preset_name,
     }
 
@@ -133,6 +195,8 @@ def load_config():
         raise ValueError("COOLDOWN_LOSS must be a non-negative integer.")
     if not isinstance(config["COOLDOWN_WIN"], int) or config["COOLDOWN_WIN"] < 0:
         raise ValueError("COOLDOWN_WIN must be a non-negative integer.")
+    if not isinstance(config["MAX_TRADES_PER_DAY"], int) or config["MAX_TRADES_PER_DAY"] < 0:
+        raise ValueError("MAX_TRADES_PER_DAY must be a non-negative integer (0 = unlimited).")
     if not isinstance(config["ADX_THRESHOLD"], (int, float)) or not (0 <= config["ADX_THRESHOLD"] <= 100):
         raise ValueError("ADX_THRESHOLD must be between 0 and 100.")
     if not isinstance(config["ADX_PERIOD"], int) or config["ADX_PERIOD"] < 1:
@@ -163,6 +227,17 @@ def load_config():
         raise ValueError("ATR_MULTIPLIER_SL must be positive.")
     if not isinstance(config["ATR_MULTIPLIER_TP"], (int, float)) or config["ATR_MULTIPLIER_TP"] <= config["ATR_MULTIPLIER_SL"]:
         raise ValueError("ATR_MULTIPLIER_TP must be greater than ATR_MULTIPLIER_SL.")
+    if config["STRATEGY_MODE"] == "rsi_dip":
+        if not (0 < config["SL_PERCENT"] < config["TP_PERCENT"] <= 1):
+            raise ValueError("SL_PERCENT/TP_PERCENT: need 0 < SL_PERCENT < TP_PERCENT <= 1.")
+        if not isinstance(config["RSI_PERIOD"], int) or config["RSI_PERIOD"] < 2:
+            raise ValueError("RSI_PERIOD must be an integer >= 2.")
+        if not (0 < config["RSI_OVERSOLD"] < 100):
+            raise ValueError("RSI_OVERSOLD must be between 0 and 100 (exclusive).")
+        if not isinstance(config["REGIME_EMA"], int) or config["REGIME_EMA"] < 2:
+            raise ValueError("REGIME_EMA must be an integer >= 2.")
+        if not isinstance(config["REGIME_SLOPE_DAYS"], int) or config["REGIME_SLOPE_DAYS"] < 1:
+            raise ValueError("REGIME_SLOPE_DAYS must be a positive integer.")
     if not isinstance(config["TRAILING_STOP_ACTIVATE"], (int, float)) or not (0 < config["TRAILING_STOP_ACTIVATE"] <= 1):
         raise ValueError("TRAILING_STOP_ACTIVATE must be between 0 (exclusive) and 1.")
     if not isinstance(config["TRAILING_STOP_CALLBACK"], (int, float)) or not (0 <= config["TRAILING_STOP_CALLBACK"] < config["TRAILING_STOP_ACTIVATE"]):

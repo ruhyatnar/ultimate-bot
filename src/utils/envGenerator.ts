@@ -37,7 +37,29 @@ BINANCE_API_KEY=${apiKey}
 BINANCE_PRIVATE_KEY_PATH=./keys/private_key.pem
 
 # --- Preset Strategy Profile ---
+# 'intraday_rsi' = backtest-proven intraday RSI-dip (NEARUSDT +33.6% engine
+# parity, PF 1.82, 174d). 'swing_rsi' = swing variant (+52.4%, PF 2.11).
 PRESET=${config.preset}
+
+# --- rsi_dip Strategy Mode ---
+# Regime gate (daily EMA) + RSI-dip trigger + FIXED % bracket. Exits ignore
+# ATR math by design; SL_PERCENT/TP_PERCENT are fractions (0.012 = -1.2%).
+STRATEGY_MODE=${config.strategyMode}
+SL_PERCENT=${config.slPercent}
+TP_PERCENT=${config.tpPercent}
+RSI_PERIOD=${config.rsiPeriod}
+RSI_OVERSOLD=${config.rsiOversold}
+RSI_TIMEFRAME=${config.rsiTimeframe}
+RSI_TIMEFRAME_MS=${config.rsiTimeframeMs}
+# 'ltf' = RSI on 5m closes sampled per RSI bucket (the proven convention)
+RSI_SOURCE=${config.rsiSource}
+REGIME_EMA=${config.regimeEma}
+REGIME_SLOPE_DAYS=${config.regimeSlopeDays}
+MAX_TRADES_PER_DAY=${config.maxTradesPerDay}
+# +1% breakeven lock — proven OFF for intraday_rsi (exits before TP)
+BREAKEVEN_ENABLED=${config.breakevenEnabled}
+# Force-close open positions at UTC day end (intraday discipline)
+CLOSE_AT_UTC_DAY_END=${config.closeAtUtcDayEnd}
 
 # --- Technical Parameters ---
 TIMEFRAME=${config.timeframe}
@@ -71,14 +93,15 @@ MAX_WIN_STREAK=${config.maxWinStreak}
 COOLDOWN_LOSS=${config.cooldownLoss}
 COOLDOWN_WIN=${config.cooldownWin}
 MAX_SLIPPAGE_PERCENT=0.5
-# TP floor: backtest-proven 0.15% on 5m (0.5% made TP ~8x the ATR stop -> 87% stop-outs)
-MIN_TP_PERCENT=0.0015
+# TP floor as fraction — must match the strategy's TP bracket
+MIN_TP_PERCENT=${config.minTpPercent}
 
 # --- Risk Model & Trade Management ---
 # 1% fixed-fractional risk per trade (qty sized from entry-to-stop distance)
 RISK_PER_TRADE=0.01
 MIN_RISK_REWARD=1.5
-SCALE_OUT_ENABLED=true
+# rsi_dip edges were proven WITHOUT scale-out; confluence presets keep it on
+SCALE_OUT_ENABLED=${config.strategyMode === 'rsi_dip' ? 'false' : 'true'}
 SCALE_OUT_R_MULTIPLE=1.0
 SCALE_OUT_FRACTION=0.5
 

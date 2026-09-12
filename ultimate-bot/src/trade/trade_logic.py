@@ -33,6 +33,11 @@ class TradeLogic:
         self._control = {}
         self._control_mtime = 0.0
         self._last_command_id = None
+        # Daily entry cap (overtrading guard): counts entries per UTC day.
+        # 0 = unlimited (default for presets other than swing_rsi).
+        self.max_trades_per_day = int(config.get("MAX_TRADES_PER_DAY", 0) or 0)
+        self._entries_day_key = None
+        self._entries_today = 0
 
     def _read_control(self):
         """Read the control file only when it changed (cheap mtime check)."""
@@ -295,13 +300,29 @@ class TradeLogic:
         if signal != "BUY":
             self.logger.debug(f"{symbol}: enter_trade called with signal={signal}; spot long-only engine ignores it.")
             return
+        # Daily entry cap: reset the counter on a new UTC day, then block
+        # further entries once MAX_TRADES_PER_DAY is reached (0 = unlimited).
+        today_key = datetime.now(timezone.utc).date()
+        if self._entries_day_key != today_key:
+            self._entries_day_key = today_key
+            self._entries_today = 0
+        if self.max_trades_per_day > 0 and self._entries_today >= self.max_trades_per_day:
+            self.logger.info(f"{symbol}: daily entry cap reached ({self._entries_today}/{self.max_trades_per_day}); entry skipped.")
+            return
         price = await self.ws_stream.get_current_price(symbol)
         if not price:
             self.logger.warning(f"{symbol}: no live price available (WS stale & REST ticker failed); skipping entry.")
             return
         entry_price = price
-        stop_price = entry_price - atr * self.config["ATR_MULTIPLIER_SL"]
-        take_profit = entry_price + atr * self.config["ATR_MULTIPLIER_TP"]
+        if self.config.get("STRATEGY_MODE") == "rsi_dip":
+            # swing_rsi mode: FIXED % bracket (the backtest-proven edge used
+            # SL -2% / TP +4% of entry, TP as a resting OCO limit = maker fee).
+            # ATR-multiplier math does not apply here.
+            stop_price = entry_price * (1 - float(self.config.get("SL_PERCENT", 0.02)))
+            take_profit = entry_price * (1 + float(self.config.get("TP_PERCENT", 0.04)))
+        else:
+            stop_price = entry_price - atr * self.config["ATR_MULTIPLIER_SL"]
+            take_profit = entry_price + atr * self.config["ATR_MULTIPLIER_TP"]
         min_tp_dist = entry_price * self.config["MIN_TP_PERCENT"]
         if take_profit - entry_price < min_tp_dist:
             take_profit = entry_price + min_tp_dist
@@ -342,6 +363,7 @@ class TradeLogic:
             return
         order_id = await self.order_mgr.place_market_order(symbol, side, qty, expected_price=entry_price)
         if order_id is None: return
+        self._entries_today += 1
         self.logger.info(f"Entry market order placed: {order_id} for {symbol}")
         filled, executed_qty = await self.order_mgr.wait_for_fill(symbol, order_id)
         if not filled:
@@ -434,30 +456,32 @@ class TradeLogic:
                     scale_qty = trade["quantity"] * float(self.config.get("SCALE_OUT_FRACTION", 0.5))
                     await self._scale_out(symbol, trade, scale_qty)
 
-            # Gap-breach protection: compare against bar LOWS/HIGHS, not just the
-            # current tick. A tick-based check alone misses violent wicks that spike
-            # through the stop between SIGNAL_INTERVAL polls and bounce back — the #1
-            # cause of unexpected deep losses in live market-only bots. We evaluate
-            # both the just-closed candle and the forming one (the exchange returns
-            # them newest-last) so a wick on a candle that closed between polls is
-            # still caught, not only the one that happens to be open right now.
-            recent = await self.rest.get_klines(symbol, self.config["TIMEFRAME"], 2)
-            if recent:
-                try:
-                    df = pd.DataFrame(recent, columns=['open_time','open','high','low','close','volume','close_time','quote_volume','trades','taker_buy_base','taker_buy_quote','ignore'])
-                    low = min(float(v) for v in df['low'].tail(2).tolist())
-                    high = max(float(v) for v in df['high'].tail(2).tolist())
-                except Exception:
-                    low = price
-                    high = price
-                # Evaluate both just-closed and forming candles (newest-last from the
-                # exchange) so a wick on a candle that closed between polls still triggers.
-                if low <= trade["stop_price"]:
-                    await self.close_trade(symbol, "STOP_LOSS", fill_override=min(trade["stop_price"], low))
-                    return
-                if high >= trade["take_profit"]:
-                    await self.close_trade(symbol, "TAKE_PROFIT", fill_override=trade["take_profit"])
-                    return
+        # Gap-breach protection: compare against bar LOWS/HIGHS, not just the
+        # current tick. A tick-based check alone misses violent wicks that spike
+        # through the stop between SIGNAL_INTERVAL polls and bounce back — the #1
+        # cause of unexpected deep losses in live market-only bots. We evaluate
+        # both the just-closed candle and the forming one (the exchange returns
+        # them newest-last) so a wick on a candle that closed between polls is
+        # still caught, not only the one that happens to be open right now.
+        # NOTE: this block runs before the intraday EOD close so a same-bar SL/TP
+        # breach always wins over the day-end market close.
+        recent = await self.rest.get_klines(symbol, self.config["TIMEFRAME"], 2)
+        if recent:
+            try:
+                df = pd.DataFrame(recent, columns=['open_time','open','high','low','close','volume','close_time','quote_volume','trades','taker_buy_base','taker_buy_quote','ignore'])
+                low = min(float(v) for v in df['low'].tail(2).tolist())
+                high = max(float(v) for v in df['high'].tail(2).tolist())
+            except Exception:
+                low = price
+                high = price
+            # Evaluate both just-closed and forming candles (newest-last from the
+            # exchange) so a wick on a candle that closed between polls still triggers.
+            if low <= trade["stop_price"]:
+                await self.close_trade(symbol, "STOP_LOSS", fill_override=min(trade["stop_price"], low))
+                return
+            if high >= trade["take_profit"]:
+                await self.close_trade(symbol, "TAKE_PROFIT", fill_override=trade["take_profit"])
+                return
             # Tick-level check as immediate backstop
             if price <= trade["stop_price"]:
                 await self.close_trade(symbol, "STOP_LOSS"); return
@@ -465,6 +489,17 @@ class TradeLogic:
                 await self.close_trade(symbol, "TAKE_PROFIT"); return
         if time.time() - trade["entry_time"] > self.config["MAX_HOLD_TIME"]:
             await self.close_trade(symbol, "TIME_STOP"); return
+
+        # intraday_rsi: force-close positions at the UTC day end so every trade
+        # matches the backtest's same-day-exit convention. Runs AFTER SL/TP checks
+        # (a stop or TP breach in the same cycle always wins) and before trailing.
+        if self.config.get("CLOSE_AT_UTC_DAY_END", False):
+            from datetime import datetime as _dt, timezone as _tz
+            now_utc = _dt.now(_tz.utc)
+            secs_into_day = now_utc.hour * 3600 + now_utc.minute * 60 + now_utc.second
+            if secs_into_day >= 86100:   # last 5 minutes of the UTC day (23:55:00)
+                self.logger.info(f"{symbol}: UTC day end (intraday close) — closing position.")
+                await self.close_trade(symbol, "EOD_CLOSE"); return
 
         if not trade["trailing_active"]:
             profit_pct = (price - trade["entry_price"]) / trade["entry_price"]
@@ -479,7 +514,7 @@ class TradeLogic:
             if price <= trade["trailing_stop"]:
                 await self.close_trade(symbol, "TRAILING_STOP"); return
 
-        if not trade.get("breakeven_activated", False):
+        if self.config.get("BREAKEVEN_ENABLED", True) and not trade.get("breakeven_activated", False):
             profit_pct = (price - trade["entry_price"]) / trade["entry_price"]
             if profit_pct >= 0.01:
                 trade["breakeven_activated"] = True
@@ -807,11 +842,103 @@ class TradeLogic:
                         self.logger.warning(f"AUTO_LIQUIDATE_ORPHANS=True: closing orphan position {symbol} balance={free_balance} (${free_balance * price:.2f})")
                         await self.order_mgr.place_market_order(symbol, "SELL", free_balance)
                         await self.webhook.send(f"⚠️ Orphan position closed for {symbol}: {free_balance} units")
-                    else:
-                        self.logger.info(f"Unmanaged balance detected for {symbol}: {free_balance} (${free_balance * price:.2f}). Leaving untouched (AUTO_LIQUIDATE_ORPHANS=False).")
+                        continue
+
+                    # ADOPT before leaving unmanaged: if this balance came from one of
+                    # OUR own recent BUY fills whose entry tracking was interrupted
+                    # (API outage / restart mid-entry), re-anchor it as a managed
+                    # trade with fresh SL/TP instead of leaving it naked. Only
+                    # bot-originated fills (orders table, MARKET BUY, recent window)
+                    # are adopted — genuine manual/deposit balances never match.
+                    adopted = await self._adopt_orphan_position(symbol, bal_info["asset"], free_balance, price)
+                    if not adopted:
+                        self.logger.info(f"Unmanaged balance detected for {symbol}: {free_balance} (${free_balance * price:.2f}). Leaving untouched (AUTO_LIQUIDATE_ORPHANS=False, not a recent bot fill).")
         except Exception as e:
             self.logger.error(f"Error during exchange sync: {e}")
             await self.webhook.send(f"❌ Exchange sync error: {e}")
+
+    async def _adopt_orphan_position(self, symbol, base_asset, free_balance, price):
+        """Re-adopt an orphaned exchange balance if it matches one of OUR recent
+        market-BUY fills that lost entry tracking (poll failure / restart).
+
+        Returns True when the position was adopted and is now SL/TP-managed.
+        The bot's own fills are proven from the local orders table — the same
+        window is cross-checked against Binance recent trades (qty match) so a
+        manual buy or a deposit can never be adopted by mistake.
+        """
+        try:
+            window_ms = int(self.config.get("ORPHAN_ADOPT_WINDOW_HOURS", 48)) * 3600 * 1000
+            cutoff = int(time.time() * 1000) - window_ms
+            row = await self.db.fetch_one(
+                "SELECT order_id, executed_qty, created_at FROM orders "
+                "WHERE symbol=? AND side='BUY' AND status='FILLED' AND created_at >= ? "
+                "ORDER BY created_at DESC LIMIT 5",
+                (symbol, cutoff))
+            if not row:
+                return False
+
+            # Quantity must match one of the recent bot BUY executions. Fee-paid
+            # buys credit slightly less than executedQty (taker fee in base), so
+            # allow the balance to be a little below the recorded fill.
+            tolerance = max(free_balance * 0.01, 1e-9)
+            if not any(abs(float(r[1] or 0) - free_balance) <= tolerance or
+                       (0 < free_balance <= float(r[1] or 0) and
+                        float(r[1]) - free_balance <= max(float(r[1]) * 0.005, 1e-9))
+                       for r in await self.db.fetch_all(
+                           "SELECT order_id, executed_qty FROM orders "
+                           "WHERE symbol=? AND side='BUY' AND status='FILLED' AND created_at >= ?",
+                           (symbol, cutoff))):
+                self.logger.info(f"{symbol}: orphan balance {free_balance} does not match any recent bot BUY fill; not adopting.")
+                return False
+
+            # Cross-check on-exchange: our recent trades for this symbol must
+            # include this quantity as a BUY (isBuyer=True) in the window.
+            try:
+                trades = await self.rest._request("GET", "/api/v3/myTrades",
+                                                  {"symbol": symbol, "limit": 20}, signed=True)
+                recent_buys = [float(t["qty"]) for t in trades
+                               if t.get("isBuyer") and int(t.get("time", 0)) >= cutoff]
+                if not any(abs(q - free_balance) <= max(q * 0.005, tolerance) for q in recent_buys):
+                    self.logger.info(f"{symbol}: exchange trade list has no matching BUY for orphan balance {free_balance}; not adopting.")
+                    return False
+            except Exception as e:
+                self.logger.warning(f"{symbol}: could not verify orphan fill on exchange ({e}); not adopting.")
+                return False
+
+            # Fresh bracket from current price using the strategy's own math.
+            entry_price = price
+            if self.config["STRATEGY_MODE"] == "rsi_dip":
+                stop_price = entry_price * (1 - float(self.config.get("SL_PERCENT", 0.02)))
+                take_profit = entry_price * (1 + float(self.config.get("TP_PERCENT", 0.04)))
+            else:
+                try:
+                    klines = await self.signal_gen._get_cached_klines(symbol, self.config["TIMEFRAME"], self.config["ATR_PERIOD"] * 10)
+                    atr = self.signal_gen._calculate_atr(self.signal_gen._to_df(klines))
+                except Exception:
+                    atr = entry_price * 0.01
+                stop_price = entry_price - atr * self.config["ATR_MULTIPLIER_SL"]
+                take_profit = entry_price + atr * self.config["ATR_MULTIPLIER_TP"]
+            min_tp_dist = entry_price * self.config["MIN_TP_PERCENT"]
+            if take_profit - entry_price < min_tp_dist:
+                take_profit = entry_price + min_tp_dist
+
+            trade = {
+                "symbol": symbol, "entry_price": entry_price, "side": "BUY",
+                "quantity": free_balance, "entry_time": int(time.time() * 1000),
+                "stop_price": stop_price, "take_profit": take_profit, "atr": 0.0,
+                "trailing_active": False, "trailing_stop": stop_price,
+                "breakeven_activated": False, "order_id": str(row[0]),
+            }
+            self.active_trades[symbol] = trade
+            await self.db.save_active_trade(trade)
+            msg = (f"✅ {symbol}: ADOPTED orphan position {free_balance} @ ~{entry_price} "
+                   f"(bot fill recovered). SL={stop_price:.6f} TP={take_profit:.6f}")
+            self.logger.warning(msg)
+            await self.webhook.send(msg)
+            return True
+        except Exception as e:
+            self.logger.error(f"{symbol}: orphan adoption failed: {e}")
+            return False
 
     async def calculate_unrealized_pnl(self):
         total = 0.0

@@ -1,9 +1,24 @@
-export type StrategyPreset = 'scalping' | 'day' | 'swing';
+export type StrategyPreset = 'scalping' | 'day' | 'swing' | 'swing_rsi' | 'intraday_rsi';
 
 export interface BotConfig {
   preset: StrategyPreset;
   timeframe: string;
   mtfTimeframe: string;
+  // --- rsi_dip strategy keys (swing_rsi / intraday_rsi presets) ---
+  strategyMode: 'rsi_dip' | 'confluence';
+  slPercent: number;          // fixed SL bracket, fraction (0.012 = -1.2%)
+  tpPercent: number;          // fixed TP bracket, fraction (0.03 = +3%)
+  rsiPeriod: number;
+  rsiOversold: number;
+  rsiTimeframe: string;       // RSI sampling bucket ('15m' swing, '1h' intraday)
+  rsiTimeframeMs: number;     // bucket size in ms (derived; explicit wins)
+  rsiSource: 'ltf' | 'htf';   // ltf = RSI on 5m closes sampled per bucket (proven)
+  regimeEma: number;          // daily EMA span for the regime gate
+  regimeSlopeDays: number;    // EMA rising-over-N-days requirement
+  maxTradesPerDay: number;    // 0 = unlimited
+  breakevenEnabled: boolean;  // +1% BE lock (must stay OFF for intraday_rsi)
+  closeAtUtcDayEnd: boolean;  // force-close open positions at UTC day end
+  minTpPercent: number;       // TP floor as fraction
   atrPeriod: number;
   atrMultiplierSl: number;
   atrMultiplierTp: number;

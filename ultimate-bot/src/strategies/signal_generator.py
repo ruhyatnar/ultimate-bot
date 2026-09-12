@@ -40,14 +40,156 @@ class SignalGenerator:
         ltf_df = await self._get_cached_klines(symbol, self.config["TIMEFRAME"], 100)
         if htf_df is None or ltf_df is None:
             return "NEUTRAL", 0
-        return self.decide(htf_df, ltf_df, symbol=symbol)
+        rsi_df = None
+        if self.config.get("STRATEGY_MODE") == "rsi_dip":
+            # Real RSI-TF candles: Wilder RSI needs ~3x its period of samples to
+            # converge — 250 x 15m buckets is converged, whereas grouping the
+            # 100-bar 5m window yields only ~25 buckets and a biased RSI that
+            # almost never reaches the oversold trigger.
+            rsi_df = await self._get_cached_klines(symbol, self.config["RSI_TIMEFRAME"], 250)
+            if rsi_df is None:
+                return "NEUTRAL", 0
+        return self.decide(htf_df, ltf_df, rsi_df=rsi_df, symbol=symbol)
 
-    def decide(self, htf_df, ltf_df, symbol: str = ""):
+    def decide(self, htf_df, ltf_df, rsi_df=None, symbol: str = ""):
         """Pure decision core: score the confluence factors on the given frames
         and return (signal, current_atr). Shared verbatim by the LIVE engine
         (via generate_signal) and the BACKTEST bar-replay (backtest.py) — one
         strategy definition, zero drift between what is backtested and what
-        trades real money."""
+        trades real money. rsi_df (RSI_TIMEFRAME candles) is only used by the
+        rsi_dip strategy mode."""
+        if self.config.get("STRATEGY_MODE") == "rsi_dip":
+            return self._decide_rsi_dip(htf_df, ltf_df, rsi_df=rsi_df, symbol=symbol)
+        return self._decide_confluence(htf_df, ltf_df, symbol)
+
+    def _decide_rsi_dip(self, htf_df, ltf_df, rsi_df=None, symbol: str = ""):
+        """swing_rsi strategy mode: daily-regime filter + RSI pullback trigger.
+
+        Backtest-proven (2026-09-10, ~113 days, $22 equity, fees + minNotional
+        modeled): NEARUSDT +52.4% (PF 2.11, WR 55.3%), 6/9 alt pairs positive;
+        see README changelog. Rules:
+
+          1. REGIME (htf_df = daily candles): last COMPLETED day closed above
+             its EMA-50 and EMA-50 is rising over REGIME_SLOPE_DAYS. If the
+             last htf row is today's partial candle (same UTC day as the last
+             ltf bar) it is dropped first — the regime never peeks at an
+             unfinished day.
+          2. TRIGGER (ltf_df = execution-TF candles): RSI(RSI_PERIOD) computed
+             on RSI_TIMEFRAME (15m) bucket closes. BUY when RSI < RSI_OVERSOLD
+             and turning up (rsi > previous bucket's rsi) — 'buy the dip, not
+             the top'. The in-progress 15m bucket is excluded so the reading
+             matches the backtest's completed-bucket convention.
+
+        Exits are handled by the % bracket (SL_PERCENT / TP_PERCENT) — this
+        mode ignores ATR bracket math by design (the tested edge used fixed
+        -2% / +4% levels).
+        """
+        current_atr = self._calculate_atr(ltf_df)
+        current_atr = current_atr.iloc[-1] if not pd.isna(current_atr.iloc[-1]) and current_atr.iloc[-1] > 0 else ltf_df['close'].iloc[-1] * 0.001
+
+        # ---- 1) daily regime on completed candles only ----
+        htf = htf_df.copy()
+        ltf_last_day = int(ltf_df['open_time'].iloc[-1]) // 86_400_000
+        if len(htf) and int(htf['open_time'].iloc[-1]) // 86_400_000 == ltf_last_day:
+            htf = htf.iloc[:-1]                      # drop today's partial daily candle
+        regime_ema = int(self.config.get("REGIME_EMA", 50))
+        slope_days = int(self.config.get("REGIME_SLOPE_DAYS", 3))
+        if len(htf) < max(regime_ema + slope_days + 5, 20):
+            self.logger.debug(f"{symbol}: rsi_dip regime not ready ({len(htf)} daily candles < {regime_ema + slope_days + 5}).")
+            return "NEUTRAL", current_atr
+        ema50 = htf['close'].ewm(span=regime_ema, adjust=False).mean()
+        regime_up = bool(htf['close'].iloc[-1] > ema50.iloc[-1]
+                         and ema50.iloc[-1] > ema50.iloc[-1 - slope_days])
+        if not regime_up:
+            self.logger.debug(f"{symbol}: rsi_dip regime DOWN/flat — no long entries.")
+            return "NEUTRAL", current_atr
+
+        # ---- 2) RSI pullback trigger ----
+        rsi_period = int(self.config.get("RSI_PERIOD", 14))
+        oversold = float(self.config.get("RSI_OVERSOLD", 40))
+        bucket_ms = int(self.config.get("RSI_TIMEFRAME_MS", 900_000))   # 15m default
+        tf_ms = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
+                 "30m": 1_800_000, "1h": 3_600_000}.get(self.config.get("TIMEFRAME", "5m"), 300_000)
+        ltf_close_ms = int(ltf_df['open_time'].iloc[-1]) + tf_ms
+        rsi_source = str(self.config.get("RSI_SOURCE", "htf")).lower()
+        if rsi_source == "ltf":
+            # intraday_rsi convention (backtest-proven): RSI(period) computed on
+            # the EXECUTION-TF close series (every 5m bar) and SAMPLED at the
+            # last completed bar of each RSI_TIMEFRAME bucket — '1h RSI(7) on
+            # 5m closes, read at :55'. NOTE: this is NOT RSI on hourly closes
+            # (that would be a ~7-hour lookback); the proven signal has a
+            # ~35-minute lookback read once per hour.
+            l = ltf_df.copy()
+            l['bucket'] = l['open_time'].astype('int64') // bucket_ms
+            # NOTE: no bucket-completion filter here. The LTF window already
+            # contains only CLOSED 5m bars ending at the signal bar, so the
+            # current bucket's last bar IS the completed read (the :55 bar
+            # when firing). Filtering bars by open_time+bucket_ms would keep
+            # only the current bucket's :00 bar and sample RSI 55min stale.
+            r_series = self._rsi_wilder(l['close'], rsi_period)
+            l = l.assign(_rsi=r_series.values)
+            rsi = l.groupby('bucket')['_rsi'].last()
+            rsi_last, rsi_prev = rsi.iloc[-1], rsi.iloc[-2]
+            if pd.isna(rsi_last) or pd.isna(rsi_prev):
+                return "NEUTRAL", current_atr
+            self.logger.debug(
+                f"{symbol}: rsi_dip regime UP, RSI(ltf)={rsi_last:.1f} (prev {rsi_prev:.1f}, "
+                f"oversold<{oversold})")
+            # Fire ONCE per bucket: the last completed bucket must close exactly
+            # at this signal bar's close (fresh bucket — no re-triggering).
+            last_bucket_close = int(rsi.index[-1]) * bucket_ms + bucket_ms
+            if last_bucket_close != ltf_close_ms:
+                return "NEUTRAL", current_atr
+            if rsi_last < oversold and rsi_last > rsi_prev:
+                return "BUY", current_atr
+            return "NEUTRAL", current_atr
+        if rsi_df is not None and len(rsi_df):
+            r = rsi_df.copy()
+        else:
+            # Degraded fallback: derive buckets from the LTF window (few samples,
+            # RSI biased — callers should provide rsi_df whenever possible).
+            r = ltf_df.copy()
+        r['bucket'] = r['open_time'].astype('int64') // bucket_ms
+        # A bucket is complete iff its close time <= the LTF signal bar's close.
+        r = r[r['open_time'].astype('int64') + bucket_ms <= ltf_close_ms]
+        c15 = r.groupby('bucket')['close'].last()
+        if len(c15) < rsi_period + 2:
+            self.logger.debug(f"{symbol}: rsi_dip RSI not ready ({len(c15)} buckets < {rsi_period + 2}).")
+            return "NEUTRAL", current_atr
+        delta = c15.diff()
+        gain = delta.clip(lower=0).ewm(alpha=1.0 / rsi_period, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1.0 / rsi_period, adjust=False).mean()
+        rs = gain / loss.replace(0, np.nan)
+        rsi = 100 - 100 / (1 + rs)
+        rsi_last, rsi_prev = rsi.iloc[-1], rsi.iloc[-2]
+        if pd.isna(rsi_last) or pd.isna(rsi_prev):
+            return "NEUTRAL", current_atr
+        self.logger.debug(
+            f"{symbol}: rsi_dip regime UP, RSI={rsi_last:.1f} (prev {rsi_prev:.1f}, "
+            f"oversold<{oversold})")
+        # Fire ONCE per dip bucket: the last completed bucket must have closed
+        # exactly at this signal bar's close (fresh bucket). Without this, the
+        # (rsi_last > rsi_prev) comparison stays true for every 5m bar of the
+        # whole 15m bucket and re-triggers after each exit.
+        last_bucket_close = int(c15.index[-1]) * bucket_ms + bucket_ms
+        if last_bucket_close != ltf_close_ms:
+            return "NEUTRAL", current_atr
+        if rsi_last < oversold and rsi_last > rsi_prev:
+            return "BUY", current_atr
+        return "NEUTRAL", current_atr
+
+    def _rsi_wilder(self, close, period):
+        """Wilder RSI on a close series (alpha = 1/period), zero-loss bars pin to 100.
+        Matches the research-lab RSI formula exactly (rsi_dip proven edge)."""
+        delta = close.diff()
+        gain = delta.clip(lower=0).ewm(alpha=1.0 / period, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1.0 / period, adjust=False).mean()
+        rs = gain / loss.replace(0, np.nan)
+        out = 100 - 100 / (1 + rs)
+        out[loss == 0] = 100.0
+        return out
+
+    def _decide_confluence(self, htf_df, ltf_df, symbol: str = ""):
         atr = self._calculate_atr(ltf_df)
         current_atr = atr.iloc[-1] if not pd.isna(atr.iloc[-1]) and atr.iloc[-1] > 0 else ltf_df['close'].iloc[-1] * 0.001
 

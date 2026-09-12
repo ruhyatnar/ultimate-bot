@@ -115,6 +115,11 @@ class OrderManager:
             if order_id is None:
                 self.logger.error("Failed to get orderId")
                 return None
+            # Retain the synchronous placement response: MARKET orders usually
+            # carry the final FILLED status + executedQty in this very payload.
+            # wait_for_fill consults it first so a later REST/API outage can
+            # never make a filled order look unfilled.
+            self.last_order_result = result if isinstance(result, dict) else {}
             self.last_order_quantity = float(qty)
             await self.db.save_order({
                 "order_id": str(order_id), "symbol": symbol, "side": side, "order_type": "MARKET",
@@ -135,6 +140,17 @@ class OrderManager:
     async def wait_for_fill(self, symbol, order_id, timeout=None):
         if self.paper_trade:
             return True, self.last_order_quantity
+        # 1) Fast path: the placement response for a MARKET order is normally
+        #    already FILLED with executedQty. Trusting it avoids any dependence
+        #    on follow-up polling (which may fail during API outages).
+        sync_res = getattr(self, "last_order_result", {}) or {}
+        if str(sync_res.get("orderId", "")) == str(order_id) and sync_res.get("status") in ("FILLED", "PARTIALLY_FILLED"):
+            executed_qty = float(sync_res.get("executedQty", 0) or 0)
+            if executed_qty > 0:
+                avg_fill_price = float(sync_res.get("avgPrice", 0) or 0)
+                await self.db.update_order_status(order_id, "FILLED" if sync_res["status"] == "FILLED" else "PARTIALLY_FILLED", executed_qty, avg_fill_price)
+                self.logger.info(f"Order {order_id} fill confirmed from placement response ({sync_res['status']}, {executed_qty} units).")
+                return True, executed_qty
         timeout = timeout or self.entry_timeout
         start = time.time()
         while time.time() - start < timeout:

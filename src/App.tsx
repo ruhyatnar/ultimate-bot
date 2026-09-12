@@ -60,36 +60,97 @@ const PRESET_MAP: Record<StrategyPreset, Partial<BotConfig>> = {
     trailingStopCallback: 0.012,
     swingLookback: 8,
     maxHoldTime: 86400
+  },
+  // swing_rsi: backtest-proven small-account swing (NEARUSDT +52.4%, PF 2.11,
+  // 113d). Mirrors config.py PRESETS.swing_rsi exactly.
+  swing_rsi: {
+    timeframe: '5m',
+    mtfTimeframe: '1d',
+    atrMultiplierSl: 0.02,
+    atrMultiplierTp: 0.04,
+    maxHoldTime: 604800,
+    strategyMode: 'rsi_dip',
+    slPercent: 0.02,
+    tpPercent: 0.04,
+    rsiPeriod: 14,
+    rsiOversold: 40,
+    rsiTimeframe: '15m',
+    rsiTimeframeMs: 900000,
+    rsiSource: 'htf',
+    regimeEma: 50,
+    regimeSlopeDays: 3,
+    maxTradesPerDay: 3,
+    breakevenEnabled: true,
+    closeAtUtcDayEnd: false,
+    minTpPercent: 0.04
+  },
+  // intraday_rsi: backtest-proven intraday dip (NEARUSDT +41.6% lab / +33.6%
+  // engine-parity, PF 1.82, 174d). Mirrors config.py PRESETS.intraday_rsi.
+  intraday_rsi: {
+    timeframe: '5m',
+    mtfTimeframe: '1d',
+    atrMultiplierSl: 0.012,
+    atrMultiplierTp: 0.03,
+    maxHoldTime: 84600,
+    strategyMode: 'rsi_dip',
+    slPercent: 0.012,
+    tpPercent: 0.03,
+    rsiPeriod: 7,
+    rsiOversold: 40,
+    rsiTimeframe: '1h',
+    rsiTimeframeMs: 3600000,
+    rsiSource: 'ltf',
+    regimeEma: 50,
+    regimeSlopeDays: 3,
+    maxTradesPerDay: 1,
+    breakevenEnabled: false,
+    closeAtUtcDayEnd: true,
+    minTpPercent: 0.03
   }
 };
 
 const DEFAULT_CONFIG: BotConfig = {
-  preset: 'day',
+  preset: 'intraday_rsi',
   timeframe: '5m',
-  mtfTimeframe: '1h',
+  mtfTimeframe: '1d',
   atrPeriod: 14,
-  atrMultiplierSl: 3.0,
-  atrMultiplierTp: 3.5,
-  trailingStopActivate: 0.015,
-  trailingStopCallback: 0.005,
+  atrMultiplierSl: 0.012,
+  atrMultiplierTp: 0.03,
+  trailingStopActivate: 0.05,
+  trailingStopCallback: 0.01,
   swingLookback: 5,
   bbPeriod: 20,
   bbStdDev: 2.0,
   bbUpperPctB: 0.95,
-  bbStretchGateEnabled: true,
-  maxHoldTime: 28800,
+  bbStretchGateEnabled: false,
+  maxHoldTime: 84600,
   signalThreshold: 4,
   signalInterval: 6,
   maxDailyDrawdown: 0.05,
   maxLossStreak: 3,
   maxWinStreak: 5,
-  cooldownLoss: 10800,
-  cooldownWin: 1800,
-  balanceUsagePercent: 0.5,
-  maxSymbolAllocationPercent: 0.2,
-  staticSymbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'],
-  dynamicSymbols: true,
-  maxSymbols: 4,
+  cooldownLoss: 86400,
+  cooldownWin: 86400,
+  balanceUsagePercent: 1.0,
+  maxSymbolAllocationPercent: 1.0,
+  // rsi_dip strategy keys — mirror the deployed .env (intraday_rsi preset)
+  strategyMode: 'rsi_dip',
+  slPercent: 0.012,
+  tpPercent: 0.03,
+  rsiPeriod: 7,
+  rsiOversold: 40,
+  rsiTimeframe: '1h',
+  rsiTimeframeMs: 3600000,
+  rsiSource: 'ltf',
+  regimeEma: 50,
+  regimeSlopeDays: 3,
+  maxTradesPerDay: 1,
+  breakevenEnabled: false,
+  closeAtUtcDayEnd: true,
+  minTpPercent: 0.03,
+  staticSymbols: ['NEARUSDT'],
+  dynamicSymbols: false,
+  maxSymbols: 1,
   adxThreshold: 25,
   adxPeriod: 14,
   paperTrade: true,
@@ -510,6 +571,15 @@ export default function App() {
         if (r.loss_streak !== undefined) {
           const val = parseInt(r.loss_streak || '0', 10);
           if (!isNaN(val)) setLossStreak(val);
+        }
+        // Engine-armed cooldown (risk_<SYMBOL>.cooldown_until, unix SECONDS):
+        // surface it in the pause banner instead of relying only on the local mirror.
+        if (r.cooldown_until !== undefined) {
+          const cu = parseInt(r.cooldown_until || '0', 10) * 1000;
+          if (!isNaN(cu) && cu > Date.now() && cu > cooldownUntilRef.current) {
+            cooldownUntilRef.current = cu;
+            setCooldownEndsAt(cu);
+          }
         }
       }
 

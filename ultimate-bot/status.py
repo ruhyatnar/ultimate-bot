@@ -116,6 +116,9 @@ TUNING_KEYS = {
     "BALANCE_USAGE_PERCENT", "MAX_SYMBOL_ALLOCATION_PERCENT",
     "MAX_DAILY_DRAWDOWN", "MAX_LOSS_STREAK", "MAX_WIN_STREAK",
     "COOLDOWN_LOSS", "COOLDOWN_WIN", "MAX_SLIPPAGE_PERCENT", "MIN_TP_PERCENT",
+    "STRATEGY_MODE", "SL_PERCENT", "TP_PERCENT", "RSI_PERIOD", "RSI_OVERSOLD",
+    "RSI_TIMEFRAME", "RSI_TIMEFRAME_MS", "RSI_SOURCE", "REGIME_EMA", "REGIME_SLOPE_DAYS",
+    "MAX_TRADES_PER_DAY", "BREAKEVEN_ENABLED", "CLOSE_AT_UTC_DAY_END",
     "DYNAMIC_SYMBOLS", "MAX_SYMBOLS", "STATIC_SYMBOLS", "QUOTE_ASSET",
     "EXCLUDE_SYMBOLS", "ADX_THRESHOLD", "ADX_PERIOD", "TOP_CANDIDATES",
     "MIN_VOLUME_USDT", "MIN_PRICE_CHANGE_PERCENT", "MIN_VOLATILITY_PERCENT",
@@ -124,7 +127,7 @@ TUNING_KEYS = {
     "CORRELATION_THRESHOLD", "CORRELATION_PENALTY", "TREND_LOOKBACK",
     "SYMBOL_REFRESH_INTERVAL", "DB_PATH", "CONTROL_FILE", "DISCORD_COOLDOWN",
     "LOG_LEVEL", "LOG_FILE", "HEALTH_CHECK_INTERVAL", "REST_WEIGHT_LIMIT",
-    "ENTRY_TIMEOUT", "AUTO_LIQUIDATE_ORPHANS",
+    "ENTRY_TIMEOUT", "AUTO_LIQUIDATE_ORPHANS", "ORPHAN_ADOPT_WINDOW_HOURS",
     "RISK_PER_TRADE", "MIN_RISK_REWARD",
     "SCALE_OUT_ENABLED", "SCALE_OUT_R_MULTIPLE", "SCALE_OUT_FRACTION",
     "BB_PERIOD", "BB_STD_DEV", "BB_UPPER_PCT_B", "BB_STRETCH_GATE_ENABLED",
@@ -494,6 +497,30 @@ def read_database(db_path):
             except Exception:
                 scanned_pairs = []
 
+        # Aggregate per-symbol risk JSON blobs (risk_<SYMBOL>) into top-level
+        # win_streak / loss_streak / cooldown keys. The engine writes streaks
+        # per symbol; the dashboard reads them at the top level, so without
+        # this aggregation the streak monitor always showed 0.
+        try:
+            worst_loss, worst_win, max_cooldown = 0, 0, 0
+            for k, v in list(risk.items()):
+                if not k.startswith("risk_") or k == "risk_state":
+                    continue
+                try:
+                    st = json.loads(v)
+                    if not isinstance(st, dict):
+                        continue
+                    worst_loss = max(worst_loss, int(st.get("loss_streak", 0) or 0))
+                    worst_win = max(worst_win, int(st.get("win_streak", 0) or 0))
+                    max_cooldown = max(max_cooldown, int(st.get("cooldown_until", 0) or 0))
+                except (ValueError, TypeError):
+                    continue
+            risk["win_streak"] = str(worst_win)
+            risk["loss_streak"] = str(worst_loss)
+            risk["cooldown_until"] = str(max_cooldown)
+        except Exception:
+            pass
+
         account_balances = []
         if "account_balances" in risk:
             try:
@@ -659,7 +686,11 @@ def fetch_binance_balance(env_config, db_data):
                     pass
 
             if signature:
-                url = f"{base_url}/api/v3/account?{query}&signature={signature}"
+                # Ed25519 signatures are base64 (+ / = chars): percent-encode in
+                # the URL or the server decodes '+' as a space -> -1022. HMAC
+                # hex needs no encoding but is unaffected by it.
+                sig_enc = urllib.parse.quote(signature, safe="")
+                url = f"{base_url}/api/v3/account?{query}&signature={sig_enc}"
                 req = urllib.request.Request(url, headers={"X-MBX-APIKEY": api_key, "User-Agent": "BinanceMonitor/2.0"})
                 with urllib.request.urlopen(req, timeout=4.0) as resp:
                     if resp.status == 200:

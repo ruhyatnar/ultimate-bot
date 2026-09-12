@@ -9,7 +9,10 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "smoke": "cd ultimate-bot && ./venv/bin/python3 smoke_test.py"
+    "smoke": "cd ultimate-bot && ./venv/bin/python3 smoke_test.py",
+    "test:sync": "cd ultimate-bot && ./venv/bin/python3 sync_test.py",
+    "watch:live": "cd ultimate-bot && ./venv/bin/python3 watch_live_position.py",
+    "soak:report": "cd ultimate-bot && ./venv/bin/python3 soak_report.py"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.1.14",

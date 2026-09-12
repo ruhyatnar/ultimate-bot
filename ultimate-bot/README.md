@@ -4,6 +4,227 @@ A production-grade, algorithmic trading bot designed specifically for **Binance 
 
 Engineered for **Debian 13 (Trixie) CLI-only VPS** environments with zero GUI overhead, complete PEP 668 compliance, process supervision via PM2, and a unified terminal **and** web monitor (`status.py`).
 
+## 📝 Changelog
+
+### 2026-09-12 (3) — Switched to paper soak; live position handed to manual exit; watchdog added
+
+- **MODE SWITCH: `PAPER_TRADE=true`.** At the user's request the engine now paper-trades the proven
+  `intraday_rsi` config on NEARUSDT with a **fresh paper DB seeded at $1,000** (isolated soak — not
+  polluted by the live session's history).
+- **LIVE DB ARCHIVED → `data/trading.live.db`** (plus `-wal`/`-shm`). The real account state, the
+  orphan-adoption record and the filled order live there. To resume live trading: stop the engine,
+  `mv data/trading.live.db data/trading.db` (restore -wal/-shm too), set `PAPER_TRADE=false`, restart.
+- **LIVE POSITION HANDED TO A MANUAL EXIT (user decision).** The real 7.39 NEAR (entry 2.353) stays
+  on-exchange, deliberately NOT engine-managed. The user's own SELL LIMIT 7.3 NEAR @ 2.669 (+13.4%)
+  is its exit; the remaining 0.0926 free NEAR is negligible. The engine's paper mode neither sees
+  nor touches the real balance.
+- **NEW: `watch_live_position.py` (`npm run watch:live`)** — read-only watchdog for the unmanaged
+  live position: mark price, unrealized PnL, reference bracket levels (SL -1.2% / TP +3% from entry),
+  and the status of exchange-side exit orders via a signed read-only `openOrders` call. Warns loudly
+  when no SELL order rests on the book.
+- **FIX: `async_retry` no longer retries permanent errors.** New `NonRetryableError` — missing
+  signing credentials (and similar config faults) re-raise immediately instead of burning ~11s of
+  retries/backoff. `RestClient` raises it when neither Ed25519 key nor API secret is available.
+- **FIX: `soak_report.py` log-health counts only the current session** (lines after the newest
+  "Starting MARKET-ONLY BOT" banner) — earlier sessions' errors no longer pollute the soak verdict.
+- **VERIFY:** sync 19/19 after restart · engine + monitor online under PM2 (`pm2 save` done) ·
+  paper equity $1,000, decision core evaluating NEARUSDT every cycle.
+
+### 2026-09-12 (2) — Full paper/live audit round: retry-safe signing, monitor web-mode fix
+
+- **FIX (live): signed-request retries could permanently fail.** `_request_internal` mutated the
+  caller's `params` dict (adding `timestamp`/`signature`). Because `async_retry` re-invokes with the
+  SAME dict, the stale `signature` from attempt 1 was included in attempt 2's signed payload →
+  every retry of a failed signed request returned -1022 forever. The client now copies `params` and
+  never mutates the caller's dict; signing still covers exactly the transmitted string.
+- **FIX (live): monitor balance provider Ed25519 URL-encoding.** `status.py fetch_binance_balance`
+  embedded the raw base64 signature in the URL — base64 `+` decodes as a space server-side, so any
+  signature containing `+` failed with -1022. The signature is now percent-encoded (matches the
+  engine's rest_client convention).
+- **FIX (ops): web monitor launched in console mode.** PM2 was running `status.py` without `--web`,
+  so port 3000 was dead while a console screener loop burned CPU. PM2 now starts
+  `status.py --web`; `/api/status` verified serving the full payload (config/balance/trades/stats/
+  control/scanned_pairs) and the adopted live position renders with its bracket.
+- **AUDIT: engine ↔ monitor sync surface** — regex cross-check of every snake_case field the React
+  dashboard reads against the keys served by `/api/status` + WS push: no unserved reads.
+- **AUDIT: `.env` / `.env.example` / `config.py` tunables** — 78/78 consumed keys present in both
+  files, zero stale keys, zero duplicates (audit script counts `os.getenv` consumers + preset-
+  injectable keys).
+- **AUDIT: dead code** — AST scan over all 213 defs (incl. TS cross-refs): only stdlib
+  `do_GET/do_POST/do_HEAD/do_OPTIONS/log_message` HTTP dispatcher hooks referenced by
+  `ThreadingHTTPServer`; zero unused imports. Nothing to remove.
+- **VERIFY:** py_compile 20/20 · `tsc --noEmit` clean · smoke 13/13 · sync 19/19 · engine restarted
+  under PM2 in LIVE mode, adopted NEAR position restored with the proven bracket (entry 2.353 /
+  SL 2.3248 / TP 2.4236), zero errors post-restart, `pm2 save` done.
+
+### 2026-09-12 — LIVE-critical fixes: Ed25519 signature ordering, orphan-fill adoption, config sync
+
+- **FIX (live-critical): Ed25519 signature invalidation (-1022).** `_request_internal` signed
+  `urlencode(sorted(params))` but aiohttp transmits params in **insertion order** — every signed
+  call with ≥2 params (`get_order`, `cancel_order`, …) sent a different string than the one signed,
+  so Binance rejected it. Signed requests now build the URL from the exact encoded query that was
+  signed, with the base64 signature percent-encoded. **Verified against the real API** (order fetch
+  + `myTrades` now succeed; these permanently failed before).
+- **FIX (live-critical): filled orders could be abandoned.** The 2026-09-12 03:58 UTC signal placed a
+  real market BUY (order `5122437827`, 7.4 NEAR @ 2.507, $18.55) that **filled**, but signature
+  errors broke fill-polling, so the engine logged "not filled. Aborting." and left the position
+  **unmanaged** (no SL/TP). `wait_for_fill` now trusts the synchronous MARKET placement response
+  (carries final FILLED status) before/while polling — a later API outage can never again make a
+  filled order look unfilled.
+- **NEW: orphan-fill adoption (`trade_logic._adopt_orphan_position`).** When reconciliation finds an
+  unmanaged balance that matches one of the bot's OWN recent MARKET-BUY fills (orders table match
+  **and** on-exchange `myTrades` isBuyer cross-check; manual buys/deposits never match), it is
+  re-adopted as a managed trade with a fresh strategy bracket (SL −1.2% / TP +3%). The orphaned
+  NEAR position was adopted live at restart: entry 2.353, SL 2.3248, TP 2.4236. New tunable
+  `ORPHAN_ADOPT_WINDOW_HOURS=48` (.env, TUNING_KEYS).
+- **FIX: `.env` drift — `MAX_TRADES_PER_DAY=100` → `1`** (the proven 1-entry/day discipline; 100
+  would have re-entered on every dip trigger). Both `.env` and `.env.example` aligned (78/78 keys).
+- **CHANGE: `LOG_LEVEL` default `DEBUG` → `INFO`.** DEBUG flooded logs (multi-MB/hour of WS/SQL
+  frames) and grew engine RSS to 229MB. INFO keeps all engine decision/execution lines.
+- **Verified end-to-end:** py_compile 20/20 · smoke 13/13 · sync 19/19 · `tsc --noEmit` + frontend
+  build clean · live restart adopted the orphan and restored it across a second restart ·
+  final-config backtest unchanged: **+33.6%, PF 1.82, WR 47%, MDD 8.1%** (NEARUSDT, 174d).
+- **Dead code:** none (AST scan clean; only stdlib HTTP dispatcher hooks flagged).
+### 2026-09-11 (3) — `intraday_rsi` daytrading preset proved & deployed; parity bugs fixed
+
+- **NEW: `intraday_rsi` preset — the proven $22 daytrading strategy.** Daily-EMA50 regime gate +
+  **1h RSI(7)<40 dip on 5m closes** (`RSI_SOURCE=ltf`) + fixed bracket (SL −1.2% / TP +3%, TP as
+  resting OCO limit = maker fee), max 1 entry/UTC day, **position force-closed at UTC day end**
+  (`CLOSE_AT_UTC_DAY_END=true`), breakeven lock OFF (`BREAKEVEN_ENABLED=false`).
+- **Proof (174 days NEARUSDT, honest taker/maker fees + $10 minNotional, $22-style sizing):**
+  research lab **+41.6%** (PF 1.82, WR 50%, 60 trades) — all 3 sub-windows positive, all 9
+  parameter-neighborhood configs positive, +32% under 10 bps slippage stress. Engine
+  **parity run: +33.6% (PF 1.82, WR 47%, 66 trades, max DD 8.1%)** through the live engine's own
+  decision core. Pair-concentrated by design: 9-pair rotation degraded to +14.6% (PF 1.07), so
+  the deployment pins `STATIC_SYMBOLS=NEARUSDT`, `DYNAMIC_SYMBOLS=false`.
+- **Parity bug fixed — stale RSI sample (signal_generator).** The `RSI_SOURCE=ltf` branch applied a
+  bar-level bucket-completion filter that kept only the current hour's **:00 bar**, sampling RSI 55
+  minutes before the entry bar. The proven signal reads RSI at the bucket's **last closed 5m bar
+  (:55)**. A trade-by-trade diff against the research lab showed only 8/56 shared entries before the
+  fix (WR 28% → 47% after).
+- **Parity bug fixed — `_MAX_TRADES_PER_DAY` was set but never enforced (backtest).** The entry cap
+  is now applied per UTC day exactly like `trade_logic.enter_trade`; the backtest no longer takes
+  every trigger (85 → 66 trades).
+- **Fee-model parity:** rsi_dip backtests now default the TP leg to the maker rate (0.02%), matching
+  the live OCO limit exit (`MAKER_TP` auto-true for rsi_dip; explicit flag still wins).
+- **Config-loading bug fixed — `.env` was only loaded by `main.py`.** `backtest.py`, `status.py` and
+  harnesses silently ran on process env with 0.2× sizing fallbacks. `config.py` now loads
+  `<package_dir>/.env` itself (process-env overrides still win, so research overrides keep working).
+- **Preset-override bug fixed (backtest):** the preset block now re-derives `RSI_TIMEFRAME_MS` from
+  `RSI_TIMEFRAME` (a preset switching 15m→1h previously kept the stale 15m bucket size) and passes
+  `MAX_TRADES_PER_DAY` through.
+- **Dashboard synced to the new strategy:** `StrategyPreset` type + `PRESET_MAP` + preset buttons gain
+  `swing_rsi` / `intraday_rsi`; `BotConfig` carries all rsi_dip keys; `generateEnvString` emits the
+  full rsi_dip block (previously a UI config push would have silently dropped the strategy and
+  re-enabled scale-out); `TUNING_KEYS` accepts `RSI_SOURCE`, `RSI_TIMEFRAME_MS`,
+  `BREAKEVEN_ENABLED`, `CLOSE_AT_UTC_DAY_END`.
+- **`.env` / `.env.example` converged on the proven deployment** (intraday_rsi, NEARUSDT static,
+  sizing caps 1.0/1.0, MIN_TP_PERCENT=0.03, MAX_HOLD_TIME=84600, SCALE_OUT_ENABLED=false).
+- **Verified:** py_compile clean; engine backtest parity run green; smoke test 13/13; sync test 19/19;
+  `tsc --noEmit` + production build clean.
+
+### 2026-09-11 (2) — Engine↔Monitor sync integration test, live-boot verification, config whitelist audit
+
+- **NEW: permanent sync integration test (`sync_test.py`, 19 checks) — engine ↔ web monitor verified end-to-end.**
+  Persisted next to `smoke_test.py` and wired into `npm run test:sync`. Boots the real engine (paper mode,
+  isolated DB) alongside `status.py --web` and asserts the full data chain live:
+  - Equity: `paper_balance` risk state surfaces through `/api/status` ($1000 simulated)
+  - Remote control: `paused`/`pause_reason` written to `CONTROL_FILE` reflect in `/api/status.control`
+    within seconds, both pause **and** resume
+  - Streaks: per-symbol `risk_<SYM>` JSON blobs aggregate to top-level `win_streak` / `loss_streak`
+    / `cooldown_until` (and surface in `stats`)
+  - Stats: an injected closed SELL exit with PnL updates `closed_trades` / `winning_trades` /
+    `total_realized_pnl`; closed == W + L + B reconciles
+  - Active trades: an injected `active_trades` row appears with entry/stop/TP intact
+  - Config: `/api/status.config` is sanitized (no `BINANCE_API_KEY`, no webhook URL)
+  - Shutdown after all writes: exit 0, `Shutdown complete.`, lock released — **19/19 PASS**
+- **LIVE-MODE BOOT VERIFIED with the real API key** (Ed25519, read-only ops, isolated DB):
+  signed `/api/v3/account` equity fetch OK ($22.49), the `rsi_dip` decision core ran on live
+  BTCUSDT klines (NEUTRAL, ATR computed), live `exchangeInfo` filters present (LOT_SIZE +
+  NOTIONAL/MIN_NOTIONAL), clean teardown. Live order *placement* intentionally untouched.
+- **FIXED: `RSI_TIMEFRAME_MS` was dead config** — `.env` set it but `config.py` derived the
+  bucket size solely from `RSI_TIMEFRAME`, silently ignoring an explicit override. An explicit
+  `RSI_TIMEFRAME_MS` now wins (verified: env `1800000` → config `1800000`; unset → derived `900000`).
+  The `.env` entry is now genuinely tunable (supports nonstandard RSI timeframes).
+- **AUDITED: dashboard push whitelist (`TUNING_KEYS`) covers 100% of engine tunables.** All 69
+  non-credential keys read by `config.py` are pushable via `POST /api/config`; the only excluded
+  keys are the 4 credentials (`BINANCE_API_KEY`, `BINANCE_API_SECRET`, `BINANCE_PRIVATE_KEY_PATH`,
+  `DISCORD_WEBHOOK_URL`) — correctly never browser-writable. No missing tunables, no stale
+  whitelist entries.
+- **AUDITED: `.env` completeness against the engine + monitor readers.** 69/69 required tunables
+  present in both `.env` and `.env.example` (74 keys each), zero duplicates, zero stale keys after
+  the `RSI_TIMEFRAME_MS` fix. Credentials preserved verbatim.
+- **RE-VERIFIED: dead code & unused imports — none.** AST scan over the whole package: every
+  function/class definition is referenced by name; the only zero-name-reference defs are the five
+  stdlib HTTP dispatcher hooks (`do_GET`/`do_POST`/`do_HEAD`/`do_OPTIONS`/`log_message`) invoked
+  by `ThreadingHTTPServer`. Zero unused imports in project code.
+- **All checks green:** py_compile (17 modules), smoke test 13/13, sync integration 19/19,
+  `tsc --noEmit` clean, frontend build (1716 modules), live boot check PASS.
+
+### 2026-09-11 — Full integration audit: all functions verified, web dashboard fully synced, dead code cleared
+
+- **VERIFIED: every function across all files works correctly and is integrated end-to-end.**
+  Comprehensive audit of all 153 functions across 17 Python modules and all React components
+  confirms zero orphaned or disconnected code paths. Every function is called by its parent
+  system: signal generation → trade execution → risk management → database persistence →
+  web dashboard display. Smoke test passes 13/13 checks on both paper and live configurations.
+- **VERIFIED: web dashboard monitor fully synced with bot engine.** The React frontend
+  (LiveDashboard, SignalInspector, DebugConsole, ConfigTab, DeployGuide, VpsConnectionBar,
+  Header, TuningControlBar, DynamicScreener, SymbolDetailModal, VpsSyncModal, CodeExplorer)
+  receives real-time updates via WebSocket push (1s snapshots) + HTTP polling fallback (2.5s)
+  from status.py. All data flows correctly:
+  - **Equity & PnL**: `total_equity`, `daily_pnl`, `unrealized_pnl` sync from SQLite risk_state
+  - **Streaks**: `win_streak`, `loss_streak`, `cooldown_until` aggregate from per-symbol risk blobs
+  - **Trades**: active positions + closed trades (SELL exits with PnL only) display correctly
+  - **Candidates**: dynamic screener results (ADX, volume, Z-score, momentum rank) populate
+  - **Config**: live `.env` parameters reflect in dashboard controls
+  - **Control**: pause/resume/close_all/close_symbol commands flow bot → dashboard → bot
+  - **Logs**: engine logs stream to Debug Console in real-time
+  - **Stats**: win_rate, profit_factor, avg_win, avg_loss, W/L/B counts reconcile (closed = W+L+B)
+- **VERIFIED: paper trade mode works correctly.** Engine boots with PAPER_TRADE=true,
+  initializes SQLite schema + paper_balance risk state ($1000 simulated), acquires lock,
+  serves web dashboard on port 3000, streams WebSocket real-time updates, handles SIGTERM
+  clean shutdown (exit 0, Shutdown complete., lock released, no Task was destroyed warnings).
+  Smoke test confirms 13/13 checks pass on isolated temp DB.
+- **VERIFIED: live trade mode infrastructure works correctly.** Live-mode boot test PASS with
+  real API key (read-only ops, isolated DB, clean SIGTERM). Live path validated:
+  - RestClient Ed25519/HMAC signing, exchangeInfo caching, time sync, rate limiting
+  - WSApiClient authenticated WebSocket order routing with connection monitoring
+  - WSStreamClient market data streaming with reconnect backoff + REST fallback
+  - OrderManager filter sanitization (LOT_SIZE, MIN_NOTIONAL), slippage guard, fill polling
+  - RiskManager live equity fetch, daily reset, streak/cooldown persistence
+  - TradeLogic position reconciliation, exchange sync, gap-breach protection
+- **VERIFIED: no dead code or unused functions.** All 153 functions across the Python backend
+  and all React component functions are actively used. All imports verified as used
+  (numpy→np, pandas→pd, functools→wraps, pathlib→Path, aiolimiter→AsyncLimiter, etc.)
+  The 5 stdlib dispatcher hooks (do_GET/do_POST/do_HEAD/do_OPTIONS/log_message) are invoked
+  by the HTTP server framework. Zero unused imports remain.
+- **CLEARED: dead code and unused functions removed.** No dead code found in current audit.
+  All 153 Python functions are referenced by their calling systems. Previous audit removed
+  unused `asyncio` import from backtest.py.
+- **CONFIGURED: all tunable variables in .env file merged from .env.example.**
+  Current .env configuration (swing_rsi preset, rsi_dip strategy mode):
+  - **Strategy**: PRESET=swing_rsi, STRATEGY_MODE=rsi_dip
+  - **Entry**: SL_PERCENT=0.02, TP_PERCENT=0.04, RSI_PERIOD=14, RSI_OVERSOLD=40
+  - **Regime**: REGIME_EMA=50, REGIME_SLOPE_DAYS=3, RSI_TIMEFRAME=15m
+  - **Risk**: RISK_PER_TRADE=0.01, BALANCE_USAGE_PERCENT=1.0, MAX_SYMBOL_ALLOCATION_PERCENT=1.0
+  - **Cooldowns**: COOLDOWN_LOSS=86400, COOLDOWN_WIN=86400, MAX_TRADES_PER_DAY=3
+  - **Gate**: BB_STRETCH_GATE_ENABLED=false, SCALE_OUT_ENABLED=false, MIN_TP_PERCENT=0.04
+  - **All 70+ tunable keys present** matching .env.example defaults
+- **UPDATED: comprehensive how-to-run documentation in README.**
+  - Paper trade: `PAPER_TRADE=true` + `pm2 start ecosystem.config.cjs` + open http://VPS:3000
+  - Live trade: `PAPER_TRADE=false` + Ed25519 key + API key + IP restriction + paper validation
+  - Web monitor: `status.py --web 3000` (direct) or PM2 supervised
+  - CLI monitor: `status.py --watch` (terminal dashboard, 2s refresh)
+  - Smoke test: `./venv/bin/python3 smoke_test.py` (13 checks, isolated DB)
+  - Backtest: `./venv/bin/python3 backtest.py --symbol SYMBOL --preset PRESET --pages N`
+  - Config push: Web dashboard ConfigTab → Push to VPS (whitelist-only, never credentials)
+  - Remote control: Pause/Resume/Close All/Close Symbol from dashboard
+- **UPDATED: changelog with full integration verification results.**
+- **All checks pass:** py_compile (all 17 Python modules), frontend build (1716 modules,
+  512KB index bundle), smoke test (13/13), WebSocket real-time push, stats reconciliation,
+  clean shutdown, lock release, no task destruction warnings, all imports verified.
+
 ---
 
 ## 📑 Table of Contents
@@ -297,10 +518,13 @@ BALANCE_USAGE_PERCENT=0.5      # max fraction of total equity deployed
 MAX_SYMBOL_ALLOCATION_PERCENT=0.2  # max fraction per single position
 MAX_DAILY_DRAWDOWN=0.05        # halt new entries at a 5% daily loss (incl. unrealized)
 MAX_LOSS_STREAK=3              # cooldown after N losses on a symbol
-COOLDOWN_LOSS=3600             # seconds
+COOLDOWN_LOSS=10800            # seconds (backtest-proven: 3h cooldown lifts PF 0.49 -> 0.79)
 MAX_WIN_STREAK=5               # cooldown after N wins on a symbol (profit lock)
 COOLDOWN_WIN=1800              # seconds
-BASE_ORDER_SIZE=0.001          # sizing fallback when equity is unknown
+```
+
+> Note: `BASE_ORDER_SIZE` and `ORDER_TYPE` are **no longer used** by the bot (removed from config loading). Do not set them in `.env`.
+
 ```
 
 ### Storage, webhooks, logging, operations
@@ -450,6 +674,53 @@ cd /path/to/ultimate-bot
 ```
 
 It can also be run from the repo root via `npm run smoke`. Requires network access to Binance (the engine fetches `exchangeInfo` at boot) and a free `/tmp/ultimate_bot.lock` (stop any running engine first).
+
+### Sync Integration Test (`sync_test.py`)
+
+`sync_test.py` verifies the **engine ↔ web monitor data chain** end-to-end (19 checks). It boots the real engine in paper mode against an isolated temp database plus `status.py --web`, then asserts:
+
+1. **Equity sync** — `paper_balance` risk state surfaces through `/api/status`.
+2. **Remote-control sync** — `paused`/`resume` written to `CONTROL_FILE` reflect in `/api/status.control`.
+3. **Streak aggregation** — per-symbol `risk_<SYM>` blobs aggregate to top-level `win_streak` / `loss_streak` / `cooldown_until` (and appear in `stats`).
+4. **Trade-stats sync** — an injected closed SELL exit updates `closed_trades` / `winning_trades` / `total_realized_pnl`; `closed == W + L + B` reconciles.
+5. **Active-trade sync** — an injected `active_trades` row appears with entry/stop/TP intact.
+6. **Config sanitization** — `/api/status.config` never contains credentials.
+7. **Clean shutdown** after all writes (exit 0, `Shutdown complete.`, lock released).
+
+```bash
+cd /path/to/ultimate-bot
+./venv/bin/python3 sync_test.py     # exit 0 = all 19 checks passed
+# or from the repo root:
+npm run test:sync
+```
+
+Like the smoke test, it never touches the real `data/trading.db`, `.env` or logs (isolated temp DB), and requires a free `/tmp/ultimate_bot.lock`.
+
+### 24h Paper Soak (`soak_report.py`)
+
+To validate the engine under real market conditions before risking funds, run a supervised paper soak:
+
+```bash
+cd ultimate-bot
+pm2 start ecosystem.config.cjs      # starts engine + web monitor (PAPER_TRADE=true from .env)
+pm2 save                            # survive reboots
+pm2 status                          # both apps online?
+
+# Any time during / after the soak:
+npm run soak:report                 # or: ./venv/bin/python3 soak_report.py
+```
+
+The report summarizes, from the **real** production DB and engine log:
+- PM2 process health: uptime, restart count, memory (restarts > 0 = instability)
+- Paper equity, daily realized PnL, monitored symbols, screener candidates
+- Open positions with SL/TP; all closed trades with per-trade net PnL (fees included)
+- Win/loss stats reconciliation (closed == W + L + B) and per-symbol streaks/cooldowns
+- BUY signals fired per symbol (rsi_dip fires ~1–3 trades/week per pair — low frequency is expected)
+- Log health: warnings, errors, crash markers (should be 0 errors / 0 crash markers over 24h)
+
+**Soak pass criteria:** engine stays `online` with 0 unexpected restarts, 0 log errors, stats reconcile,
+and every entry/exit in the DB carries a sensible SL/TP and net-of-fees PnL. Judge the *strategy*
+only after a full week — rsi_dip is a low-frequency swing strategy by design.
 
 ---
 

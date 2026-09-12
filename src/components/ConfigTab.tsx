@@ -115,6 +115,26 @@ export const ConfigTab: React.FC<ConfigTabProps> = ({
             >
               Swing Trading (15m / 4h)
             </button>
+            <button
+              onClick={() => onApplyPreset('intraday_rsi')}
+              className={`px-3.5 py-2 rounded-lg text-xs font-bold transition-all ${
+                config.preset === 'intraday_rsi'
+                  ? 'bg-emerald-600 text-white shadow-lg shadow-emerald-600/30 border border-emerald-400'
+                  : 'bg-slate-900/80 text-slate-300 hover:bg-slate-700 border border-slate-700'
+              }`}
+            >
+              🎯 Intraday RSI Dip (5m/1d) ★
+            </button>
+            <button
+              onClick={() => onApplyPreset('swing_rsi')}
+              className={`px-3.5 py-2 rounded-lg text-xs font-bold transition-all ${
+                config.preset === 'swing_rsi'
+                  ? 'bg-emerald-600 text-white shadow-lg shadow-emerald-600/30 border border-emerald-400'
+                  : 'bg-slate-900/80 text-slate-300 hover:bg-slate-700 border border-slate-700'
+              }`}
+            >
+              🎯 Swing RSI Dip (5m/1d)
+            </button>
           </div>
         </div>
       </div>

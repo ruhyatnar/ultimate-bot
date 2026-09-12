@@ -80,7 +80,7 @@ export const TuningControlBar: React.FC<TuningControlBarProps> = ({
             <span>Active Preset:</span>
           </span>
           <div className="inline-flex rounded-lg bg-slate-800 p-1 border border-slate-700/60 text-xs">
-            {(['scalping', 'day', 'swing'] as StrategyPreset[]).map((p) => {
+            {(['scalping', 'day', 'swing', 'swing_rsi', 'intraday_rsi'] as StrategyPreset[]).map((p) => {
               const isSelected = config.preset === p;
               return (
                 <button
@@ -96,6 +96,7 @@ export const TuningControlBar: React.FC<TuningControlBarProps> = ({
                   {p === 'scalping' && '⚡ '}
                   {p === 'day' && '📅 '}
                   {p === 'swing' && '🌊 '}
+                  {(p === 'swing_rsi' || p === 'intraday_rsi') && '🎯 '}
                   {p}
                 </button>
               );

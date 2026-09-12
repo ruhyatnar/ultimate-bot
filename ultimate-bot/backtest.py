@@ -25,8 +25,8 @@ Usage:
 Exit code 0 = backtest ran (regardless of profitability), 2 = could not run.
 """
 import argparse
-import asyncio
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -115,7 +115,10 @@ def _compute_adx(df, period=14):
 def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False, disable_bb=False,
                  threshold=None, sl_mult=None, tp_mult=None, scale_frac=None, bb_pctb=None,
                  cooldown_bars=None, min_tp=None, bb_lower=None, adx_min=None,
-                 vol_mult=None, be_r=None, trail_r=None, max_hold=None, maker_tp=False):
+                 vol_mult=None, be_r=None, trail_r=None, max_hold=None, maker_tp=None,
+                 min_notional=None, equity=None,
+                 balance_usage_percent=None, max_symbol_allocation_percent=None,
+                 scale_enabled=None):
     cfg = load_config()
     cfg["TIMEFRAME"] = PRESETS[preset_name]["TIMEFRAME"]
     cfg["MTF_TIMEFRAME"] = PRESETS[preset_name]["MTF_TIMEFRAME"]
@@ -127,8 +130,30 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False, disable
     cfg["SWING_LOOKBACK"] = PRESETS[preset_name]["SWING_LOOKBACK"]
     cfg["MAX_HOLD_TIME"] = PRESETS[preset_name]["MAX_HOLD_TIME"]
     cfg["MIN_TP_PERCENT"] = PRESETS[preset_name].get("MIN_TP_PERCENT", cfg["MIN_TP_PERCENT"])
-    # Strategy-research overrides — applied AFTER the preset block so they win
+    # swing_rsi (rsi_dip mode): pass the preset's strategy keys through so the
+    # backtest replays the exact live-engine configuration.
+    for _k in ("STRATEGY_MODE", "SL_PERCENT", "TP_PERCENT", "RSI_PERIOD",
+               "RSI_OVERSOLD", "RSI_TIMEFRAME", "RSI_TIMEFRAME_MS", "RSI_SOURCE",
+               "REGIME_EMA", "REGIME_SLOPE_DAYS", "COOLDOWN_LOSS",
+               "BREAKEVEN_ENABLED", "CLOSE_AT_UTC_DAY_END", "MAX_TRADES_PER_DAY"):
+        if _k in PRESETS[preset_name]:
+            cfg[_k] = PRESETS[preset_name][_k]
+    if cfg.get("STRATEGY_MODE") == "rsi_dip":
+        # The preset block may override RSI_TIMEFRAME (e.g. swing_rsi 15m vs
+        # intraday_rsi 1h) — the derived bucket size must follow it, or the
+        # RSI trigger silently samples the wrong interval.
+        cfg["RSI_TIMEFRAME_MS"] = {"15m": 900_000, "30m": 1_800_000, "1h": 3_600_000,
+                                   "4h": 14_400_000, "1d": 86_400_000}.get(
+            str(cfg.get("RSI_TIMEFRAME", "15m")), 900_000)
+    if cfg.get("STRATEGY_MODE") == "rsi_dip":
+        # The proven edge used a pure SL/TP bracket: no breakeven lock, no
+        # trailing stop (both would exit before the +4% TP or after a +1%
+        # reversal). Giant R triggers make be_thr/trail_thr unreachable.
+        cfg["BE_TRIGGER_R"] = 1e9
+        cfg["TRAIL_ACTIVATE_R"] = 1e9    # Strategy-research overrides — applied AFTER the preset block so they win
     # (None = keep the preset/env value; used by sweeps and CLI flags).
+    alloc_balance_frac = float(cfg.get("BALANCE_USAGE_PERCENT", 0.5))
+    alloc_symbol_frac = float(cfg.get("MAX_SYMBOL_ALLOCATION_PERCENT", 0.2))
     if disable_bb:
         cfg["BB_STRETCH_GATE_ENABLED"] = False   # A/B: measure the gate's value
     if threshold is not None: cfg["SIGNAL_THRESHOLD"] = int(threshold)
@@ -143,7 +168,18 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False, disable
     if be_r is not None: cfg["BE_TRIGGER_R"] = float(be_r)             # research: R-based breakeven trigger
     if trail_r is not None: cfg["TRAIL_ACTIVATE_R"] = float(trail_r)   # research: R-based trailing trigger
     if max_hold is not None: cfg["MAX_HOLD_TIME"] = float(max_hold)    # research: time-stop override (seconds)
-    cfg["MAKER_TP"] = bool(maker_tp)                                   # research: TP leg pays maker (0.02%) not taker
+    if min_notional is not None: cfg["MIN_NOTIONAL"] = float(min_notional)  # research: Binance spot minNotional floor
+    if maker_tp is not None:
+        cfg["MAKER_TP"] = bool(maker_tp)
+    elif cfg.get("STRATEGY_MODE") == "rsi_dip":
+        # Live rsi_dip exits place the TP as an OCO LIMIT order → maker fee
+        # (0.02%). Default the fee model to match reality.
+        cfg["MAKER_TP"] = True
+    else:
+        cfg["MAKER_TP"] = str(os.getenv("MAKER_TP", "false")).lower() == "true"
+    if balance_usage_percent is not None: cfg["BALANCE_USAGE_PERCENT"] = float(balance_usage_percent)
+    if max_symbol_allocation_percent is not None: cfg["MAX_SYMBOL_ALLOCATION_PERCENT"] = float(max_symbol_allocation_percent)
+    if scale_enabled is not None: cfg["SCALE_OUT_ENABLED"] = bool(scale_enabled)
 
     import logging
     logging.disable(logging.CRITICAL)
@@ -151,14 +187,33 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False, disable
 
     tf_ms = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
              "1h": 3_600_000, "4h": 14_400_000}.get(cfg["TIMEFRAME"], 300_000)
-    # Mirror the live engine: default post-exit cooldown derives from COOLDOWN_LOSS.
+    # Mirror the live engine: default post-exit cooldown derives from COOLDOWN_LOSS,
+    # but MAX_TRADES_PER_DAY (the live engine's binding entry cap) takes precedence:
+    # when set, the backtest enforces entries-per-UTC-day instead of a blanket
+    # lockout, exactly like trade_logic.enter_trade does.
+    max_per_day = int(cfg.get("MAX_TRADES_PER_DAY", 0) or 0)
     if cooldown_bars is None:
-        cooldown_bars = max(0, int(round(cfg["COOLDOWN_LOSS"] * 1000 / tf_ms)))
+        cooldown_bars = 0 if max_per_day > 0 else max(0, int(round(cfg["COOLDOWN_LOSS"] * 1000 / tf_ms)))
+    if max_per_day > 0:
+        cfg["_MAX_TRADES_PER_DAY"] = max_per_day   # consumed by the entry loop
     htf_ms = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
-              "1h": 3_600_000, "4h": 14_400_000}.get(cfg["MTF_TIMEFRAME"], 3_600_000)
-    warmup_bars = max(1, htf_ms // tf_ms)
-    ltf_bars = 100
-    lookback_total = warmup_bars + ltf_bars
+              "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}.get(cfg["MTF_TIMEFRAME"], 3_600_000)
+    rsi_dip_mode = cfg.get("STRATEGY_MODE") == "rsi_dip"
+    daily_df = None
+    if rsi_dip_mode:
+        # Real daily candles for the regime filter (1000 days = 1 request).
+        daily_rows = fetch_history(symbol, "1d", 1, end_time=end_time)
+        if len(daily_rows) < 70:
+            print(f"NOT ENOUGH DAILY DATA for the regime filter: got {len(daily_rows)} daily bars, need >= 70")
+            return None
+        daily_df = to_df(daily_rows)
+        warmup_bars = 288          # 1 day of 5m bars; regime warmup lives in daily_df
+        ltf_bars = 100
+        lookback_total = warmup_bars + ltf_bars
+    else:
+        warmup_bars = max(1, htf_ms // tf_ms)
+        ltf_bars = 100
+        lookback_total = warmup_bars + ltf_bars
 
     rows = fetch_history(symbol, cfg["TIMEFRAME"], pages, end_time=end_time)
     if len(rows) < lookback_total + 10:
@@ -175,12 +230,13 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False, disable
     volumes = df["volume"].tolist()
     n = len(df)
 
-    equity = 1000.0
+    equity = float(equity) if equity is not None else 1000.0
     start_equity = equity
     risk_per_trade = float(cfg.get("RISK_PER_TRADE", 0.01))
     max_daily_dd = float(cfg.get("MAX_DAILY_DRAWDOWN", 0.05))
     threshold = int(cfg["SIGNAL_THRESHOLD"])
-    scale_enabled = bool(cfg.get("SCALE_OUT_ENABLED", True))
+    scale_enabled = bool(cfg.get("SCALE_OUT_ENABLED",
+                                 False if cfg.get("STRATEGY_MODE") == "rsi_dip" else True))
     scale_r = float(cfg.get("SCALE_OUT_R_MULTIPLE", 1.0))
     scale_frac = float(cfg.get("SCALE_OUT_FRACTION", 0.5))
     min_rr = float(cfg.get("MIN_RISK_REWARD", 1.5))
@@ -191,6 +247,10 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False, disable
     # notional explode on tight stops and wildly overstates fee drag.
     alloc_cap_frac = min(float(cfg.get("BALANCE_USAGE_PERCENT", 0.5)),
                          float(cfg.get("MAX_SYMBOL_ALLOCATION_PERCENT", 0.2)))
+
+    alloc_balance_frac = float(cfg.get("BALANCE_USAGE_PERCENT", 0.5))
+    alloc_symbol_frac = float(cfg.get("MAX_SYMBOL_ALLOCATION_PERCENT", 0.2))
+    min_notional = float(cfg.get("MIN_NOTIONAL", 10.0))  # Binance spot minNotional floor (~10 USDT); trades below this cannot be placed
 
     position = None
     trades = []          # realized trade records (scale-out legs merged per entry)
@@ -294,7 +354,9 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False, disable
                         trail_thr = float(trail_r) * sl_dist0 / entry if trail_r is not None else float(cfg["TRAILING_STOP_ACTIVATE"])
                     else:
                         be_thr = trail_thr = float("inf")
-                    if not p.get("be") and profit_pct >= be_thr:
+                    # BREAKEVEN_ENABLED=false (intraday_rsi) disables the BE lock
+                    # entirely — parity with the live engine's gated lock.
+                    if cfg.get("BREAKEVEN_ENABLED", True) and not p.get("be") and profit_pct >= be_thr:
                         p["be"] = True
                         p["stop"] = max(p["stop"], entry * BE_MULTIPLIER)
                     if not p.get("trailing_active") and profit_pct >= trail_thr:
@@ -303,7 +365,24 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False, disable
                     if p.get("trailing_active"):
                         p["trailing_stop"] = max(p.get("trailing_stop") or 0,
                                                  bar_close * (1 - float(cfg["TRAILING_STOP_CALLBACK"])))
-                    # 5) time stop
+                    # 5) intraday EOD close: force-close at the UTC day end
+                    #    (parity with trade_logic CLOSE_AT_UTC_DAY_END; fills at
+                    #    the bar close with taker fee — matches the research EOD
+                    #    market exit).
+                    if cfg.get("CLOSE_AT_UTC_DAY_END", False):
+                        bar_day = int(times[i]) // 86_400_000
+                        entry_day = int(p.get("entry_ms") or times[p["entry_index"]]) // 86_400_000
+                        if bar_day != entry_day:
+                            # fill at the next-day bar's OPEN == the day-end price
+                            # (the research exited at the day's last close).
+                            leg = record(i, "TIME_STOP", bar_open, p["qty"], entry, p["initial_stop"], p["entry_fee"])
+                            equity += leg["pnl"]
+                            trades.append(_merge_legs(p, p.setdefault("legs", []) + [leg]))
+                            position = None
+                            last_exit_i = i
+                            equity_curve.append(equity)
+                            continue
+                    # 6) time stop
                     entry_ms = p.get("entry_ms") or times[p["entry_index"]]
                     if (times[i] - entry_ms) / 1000.0 > max_hold_s:
                         leg = record(i, "TIME_STOP", bar_close, p["qty"], entry, p["initial_stop"], p["entry_fee"])
@@ -322,14 +401,49 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False, disable
         if i - last_exit_i < cooldown_bars:
             equity_curve.append(equity)
             continue
+        # MAX_TRADES_PER_DAY enforcement (parity with trade_logic.enter_trade):
+        # count entries already taken this UTC day; the cap — not a blanket
+        # cooldown — is the live engine's binding frequency limiter.
+        _max_day = int(cfg.get("_MAX_TRADES_PER_DAY", 0) or 0)
+        if _max_day > 0:
+            _today = times[i] // 86_400_000
+            _taken = sum(1 for t in trades
+                         if (t.get("entry_ms") or 0) // 86_400_000 == _today)
+            if _taken >= _max_day:
+                equity_curve.append(equity)
+                continue
         htf_start = i - warmup_bars - ltf_bars + 1
         htf_win = df.iloc[htf_start: i + 1]
+        if rsi_dip_mode:
+            # Daily regime window: all daily candles strictly BEFORE the current
+            # 5m bar's UTC day → the regime never sees the in-progress day.
+            day_i = times[i] // 86_400_000
+            htf_win = daily_df[daily_df["open_time"] // 86_400_000 < day_i]
         if len(htf_win) < ltf_bars:
             equity_curve.append(equity)
             continue
         ltf_win = df.iloc[i - ltf_bars + 1: i + 1]
         # The last bar of ltf_win is the just-closed signal bar (index i).
-        signal, atr = sg.decide(htf_win, ltf_win, symbol=symbol)
+        rsi_win = None
+        if rsi_dip_mode and cfg.get("RSI_SOURCE", "htf") == "htf":
+            # Parity with the live engine's RSI-TF candle feed: completed
+            # buckets through the signal bar's close, aggregated from ALL
+            # 5m rows before i (Wilder RSI needs a long history to converge).
+            bucket_ms = int(cfg.get("RSI_TIMEFRAME_MS", 900_000))
+            hist = df.iloc[max(0, i - 8000): i + 1]
+            b = (hist["open_time"].astype('int64') // bucket_ms)
+            last_close_ms = int(times[i]) + tf_ms
+            complete = (hist["open_time"].astype('int64') + bucket_ms) <= last_close_ms
+            grp = hist[complete].groupby(b[complete])['close'].last()
+            rsi_win = grp.rename_axis('bucket').reset_index(name='close')
+            rsi_win['open_time'] = rsi_win['bucket'] * bucket_ms
+            rsi_win = rsi_win[['open_time', 'close']]
+        elif rsi_dip_mode:
+            # RSI_SOURCE=ltf: the engine computes RSI on the LTF closes directly
+            # (grouped into buckets inside _decide_rsi_dip), so no dedicated RSI
+            # frame is needed — pass None and let decide() consume ltf_df.
+            rsi_win = None
+        signal, atr = sg.decide(htf_win, ltf_win, rsi_df=rsi_win, symbol=symbol)
         if signal != "BUY" or not atr or atr <= 0:
             equity_curve.append(equity)
             continue
@@ -364,8 +478,13 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False, disable
                 continue
 
         entry = bar_close = closes[i]
-        stop = entry - atr * float(cfg["ATR_MULTIPLIER_SL"])
-        tp = entry + atr * float(cfg["ATR_MULTIPLIER_TP"])
+        if rsi_dip_mode:
+            # % bracket parity with the live engine's rsi_dip branch.
+            stop = entry * (1 - float(cfg["SL_PERCENT"]))
+            tp = entry * (1 + float(cfg["TP_PERCENT"]))
+        else:
+            stop = entry - atr * float(cfg["ATR_MULTIPLIER_SL"])
+            tp = entry + atr * float(cfg["ATR_MULTIPLIER_TP"])
         if tp - entry < entry * min_tp_pct:
             tp = entry + entry * min_tp_pct
         sl_dist = entry - stop
@@ -375,8 +494,16 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False, disable
         if (tp - entry) / sl_dist < min_rr:
             tp = entry + sl_dist * min_rr
         qty_risk = (equity * risk_per_trade) / sl_dist
-        qty_cap = (equity * alloc_cap_frac) / entry
+        qty_cap_balance = (equity * alloc_balance_frac) / entry
+        qty_cap_symbol = (equity * alloc_symbol_frac) / entry
+        qty_cap = min(qty_cap_balance, qty_cap_symbol)
         qty = min(qty_risk, qty_cap)   # engine rule: never size above the cap
+        notional = qty * entry
+        if notional < min_notional:
+            # Too small to place on Binance spot (minNotional floor). Skip silently
+            # so the backtest does not count unexecutable trades as wins/losses.
+            equity_curve.append(equity)
+            continue
         position = {
             "entry": entry, "stop": stop, "tp": tp, "qty": qty,
             "initial_stop": stop, "entry_fee": entry * qty * TAKER_FEE,
@@ -450,6 +577,16 @@ def _summarize(symbol, preset_name, cfg, start_equity, equity, trades, curve, n_
     else:
         print(f"  {symbol} {preset_name}: ret={ret_pct:+.2f}% trades={total} wr={win_rate:.0f}% "
               f"pf={pf:.2f} exp={expectancy:+.2f}R fees={total_fees:.1f} dd={max_dd:.1f}%")
+    # Research aid: dump the raw trade list (entry/exit ms + reason + pnl) so it
+    # can be diffed bar-by-bar against the research lab's own trade list.
+    _dump = os.environ.get("BACKTEST_DUMP_TRADES")
+    if _dump:
+        with open(_dump, "w") as f:
+            json.dump([{"entry_ms": t.get("entry_ms"), "exit_index": t.get("exit_index"),
+                        "reason": t.get("reason"), "pnl": round(t.get("pnl", 0.0), 6),
+                        "entry_price": t.get("entry_price"), "exit_price": t.get("exit_price")}
+                       for t in trades], f)
+        print(f"  trades dumped -> {_dump}")
     return result
 
 
@@ -474,6 +611,11 @@ def main():
     parser.add_argument("--trail-r", type=float, default=None, help="research: trailing stop activates at this R-multiple (default: TRAILING_STOP_ACTIVATE)")
     parser.add_argument("--max-hold", type=float, default=None, help="research: override MAX_HOLD_TIME in seconds")
     parser.add_argument("--maker-tp", action="store_true", help="research: TP exits pay maker fee 0.02%% (OCO limit leg) instead of taker 0.1%%")
+    parser.add_argument("--min-notional", type=float, default=None, help="research: override MIN_NOTIONAL (USDT floor below which a trade can't be placed; default 10)")
+    parser.add_argument("--equity", type=float, default=None, help="research: override starting equity (default 1000 USDT)")
+    parser.add_argument("--balance-usage-percent", type=float, default=None, help="research: override BALANCE_USAGE_PERCENT")
+    parser.add_argument("--max-symbol-allocation-percent", type=float, default=None, help="research: override MAX_SYMBOL_ALLOCATION_PERCENT")
+    parser.add_argument("--no-scale-out", action="store_true", help="research: disable the +1R scale-out (manage as one unit)")
     parser.add_argument("--quiet", action="store_true", help="suppress the per-exit event log")
     args = parser.parse_args()
 
@@ -486,7 +628,12 @@ def main():
                           min_tp=args.min_tp, bb_lower=args.bb_lower,
                           adx_min=args.adx_min, vol_mult=args.vol_mult,
                           be_r=args.be_r, trail_r=args.trail_r, max_hold=args.max_hold,
-                          maker_tp=args.maker_tp, quiet=args.quiet)
+                          maker_tp=args.maker_tp,                          min_notional=args.min_notional,
+                          equity=args.equity,
+                          balance_usage_percent=args.balance_usage_percent,
+                          max_symbol_allocation_percent=args.max_symbol_allocation_percent,
+                          scale_enabled=(False if args.no_scale_out else None),
+                          quiet=args.quiet)
     if result is None:
         return 2
     print(f"\nCompleted in {time.time() - t0:.1f}s")

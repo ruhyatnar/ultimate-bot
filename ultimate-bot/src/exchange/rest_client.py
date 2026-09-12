@@ -6,7 +6,8 @@ import hmac
 import json
 import logging
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
+from src.core.backoff import NonRetryableError
 import aiohttp
 from aiolimiter import AsyncLimiter
 from cryptography.hazmat.primitives import serialization
@@ -118,18 +119,33 @@ class RestClient:
         await self._ensure_session()
         url = f"{self.base_url}{endpoint}"
         headers = {"X-MBX-APIKEY": self.api_key} if self.api_key else {}
-        if params is None:
-            params = {}
+        # Copy: never mutate the caller's dict. async_retry re-invokes this
+        # method with the SAME dict; a mutated dict would carry the stale
+        # 'signature' from the previous attempt into the new signed payload
+        # (-> permanent -1022 on every retry of a failed signed request).
+        params = dict(params) if params else {}
         if signed:
             params["timestamp"] = await self._get_timestamp()
-            query_string = urlencode(sorted(params.items()))
+            # Sign EXACTLY the string that will be transmitted. aiohttp encodes
+            # params in insertion order (not sorted), so signing a sorted query
+            # while sending an unsorted one invalidates the signature for any
+            # request with more than one param (Binance error -1022).
+            # The signature param itself is appended after signing, so it is
+            # excluded from the signed payload — same contract as sorted signing.
+            query_string = urlencode(list(params.items()))
             if self._private_key:
                 params["signature"] = self._sign_ed25519(query_string)
             elif self.api_secret:
                 params["signature"] = self._sign_hmac_sha256(query_string)
             else:
-                raise Exception("Neither Ed25519 private key nor API secret available for signing.")
+                raise NonRetryableError("Neither Ed25519 private key nor API secret available for signing.")
             headers["Content-Type"] = "application/x-www-form-urlencoded"
+            # Transmit the pre-encoded signed query verbatim so Binance verifies
+            # byte-for-byte the same string we signed. The Ed25519 signature is
+            # base64 (may contain +/=) so it must be percent-encoded in the URL,
+            # while Binance verifies it over the raw base64 string.
+            url = f"{url}?{query_string}&signature={quote(params['signature'], safe='')}"
+            params = None
         async with self.limiter:
             async with self.session.request(method, url, params=params, headers=headers) as resp:
                 if resp.status != 200:
